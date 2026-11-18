@@ -1,0 +1,31 @@
+[package]
+name = "pulse-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pulse-model = { path = "../pulse-model" }
+spotatui-librespot-core = { version = "0.8.7", default-features = false, features = ["rustls-tls-webpki-roots"] }
+spotatui-librespot-playback = { version = "0.8.7", default-features = false, features = ["alsa-backend", "pulseaudio-backend", "rustls-tls-webpki-roots"] }
+spotatui-librespot-connect = { version = "0.8.7", default-features = false, features = ["rustls-tls-webpki-roots"] }
+spotatui-librespot-metadata = { version = "0.8.7", default-features = false, features = ["rustls-tls-webpki-roots"] }
+spotatui-librespot-protocol = "0.8.7"
+librespot-discovery = { version = "0.8.0", default-features = false, features = ["with-libmdns", "rustls-tls-webpki-roots"] }
+mpris-server = { version = "0.11.0", features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs"] }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+dirs.workspace = true
+bytes.workspace = true
+base64 = "0.22"
+http = "1"
+libpulse-binding = "2.26"
+libpulse-simple-binding = "2.25"
+log = "0.4"
+protobuf = "3"
+sha2 = "0.10"
+url = "2.5"

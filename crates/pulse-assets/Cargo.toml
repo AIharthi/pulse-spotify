@@ -1,0 +1,13 @@
+[package]
+name = "pulse-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pulse-model = { path = "../pulse-model" }
+bytes.workspace = true
+dirs.workspace = true
+image.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }

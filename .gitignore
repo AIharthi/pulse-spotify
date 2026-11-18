@@ -1,0 +1,15 @@
+# Cargo build artifacts and logs
+target/
+**/*.rs.bk
+*.pdb
+*.log
+
+# Local environment / credential files (never commit user secrets or caches)
+.env
+.env.*
+credentials.json
+auth_meta.json
+device_id
+*.token
+*.key
+.DS_Store
