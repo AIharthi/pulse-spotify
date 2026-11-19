@@ -10,6 +10,7 @@ pulse-model = { path = "../pulse-model" }
 pulse-assets = { path = "../pulse-assets" }
 # Use image-without-codecs instead of image so iced does not enable image/default (rayon + ravif).
 iced = { version = "0.14.0", default-features = false, features = [
+    "wgpu",
     "tiny-skia",
     "fira-sans",
     "tokio",

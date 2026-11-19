@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -38,6 +38,7 @@ use spotatui_librespot_protocol::connect::ClusterUpdate;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 static AUDIO_KEY_REJECTED: AtomicBool = AtomicBool::new(false);
+static FFMPEG_VORBIS_MODE: AtomicU8 = AtomicU8::new(0);
 static STAGED_TRACKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static SOUNDCLOUD_CLIENT_ID: OnceLock<AsyncMutex<Option<String>>> = OnceLock::new();
 static IN_FLIGHT_STAGING: OnceLock<Mutex<HashMap<String, watch::Sender<bool>>>> = OnceLock::new();
@@ -47,7 +48,7 @@ const SPOTIFY_OGG_HEADER_SIZE: usize = 167;
 const FALLBACK_HEADER_MAGIC: &[u8; 4] = b"PLS4";
 // Temporary magic for truncated/partial fallback clips: playable during this run, refreshed on restart.
 const TEMP_FALLBACK_MAGIC: &[u8; 4] = b"PLST";
-const DEFAULT_SOUNDCLOUD_CLIENT_ID: &str = "qLcgHhXgeEFFaSolTB9I71LBsqncsD93";
+const DEFAULT_SOUNDCLOUD_CLIENT_ID: &str = "mCvc6pfl077AipUMKehAWm2ICrAJ1xiU";
 const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FFMPEG_OUTPUT_BYTES: u64 = 24 * 1024 * 1024;
 const YOUTUBE_WEB_CLIENT_VERSION: &str = "2.20260101.00.00";
@@ -749,7 +750,13 @@ async fn http_post_json(
 }
 
 fn extract_sc_client_id_from_js(js: &str) -> Option<String> {
-    for marker in ["client_id:\"", "client_id:'", "client_id%3D"] {
+    for marker in [
+        "client_id:\"",
+        "client_id:'",
+        "client_id=\"",
+        "client_id='",
+        "client_id%3D",
+    ] {
         let mut idx = 0usize;
         while let Some(pos) = js[idx..].find(marker) {
             let start = idx + pos + marker.len();
@@ -786,7 +793,7 @@ async fn refresh_soundcloud_client_id(http: &HttpClient) -> Option<String> {
         }
         idx = start + token_len.max(PREFIX.len());
     }
-    for url in script_urls.into_iter().rev().take(5) {
+    for url in script_urls.into_iter().rev().take(6) {
         if let Some(js_bytes) = http_get_bytes(http, &url).await {
             let js = String::from_utf8_lossy(&js_bytes);
             if let Some(cid) = extract_sc_client_id_from_js(&js) {
@@ -814,6 +821,73 @@ async fn get_soundcloud_client_id(http: &HttpClient, force_refresh: bool) -> Str
         .clone()
 }
 
+fn run_ffmpeg_vorbis_pass(
+    input: &[u8],
+    use_native_vorbis: bool,
+    pid_slot: &AtomicU32,
+) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+    ]);
+    if use_native_vorbis {
+        cmd.args(["-strict", "-2", "-c:a", "vorbis", "-q:a", "4"]);
+    } else {
+        cmd.args(["-c:a", "libvorbis", "-q:a", "5"]);
+    }
+    cmd.args(["-f", "ogg", "pipe:1"]);
+
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    pid_slot.store(child.id(), Ordering::Release);
+
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+
+    let mut exceeded_cap = false;
+    let out = std::thread::scope(|s| {
+        let writer = s.spawn(move || {
+            let _ = stdin.write_all(input);
+            drop(stdin);
+        });
+        let mut ogg = Vec::new();
+        let mut limited = stdout.take(MAX_FFMPEG_OUTPUT_BYTES + 1);
+        let read_res = limited.read_to_end(&mut ogg);
+        drop(limited);
+        if ogg.len() as u64 > MAX_FFMPEG_OUTPUT_BYTES {
+            exceeded_cap = true;
+            let _ = child.kill();
+        }
+        let _ = writer.join();
+        read_res.ok().map(|_| ogg)
+    });
+
+    let status = child.wait().ok()?;
+    if exceeded_cap || !status.success() {
+        return None;
+    }
+    let ogg = out?;
+    let trimmed = trim_to_valid_ogg_pages(&ogg);
+    if trimmed.len() < 28 || &trimmed[0..4] != b"OggS" {
+        return None;
+    }
+    Some(trimmed.to_vec())
+}
+
 async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
     if input.is_empty() || input.len() > MAX_DOWNLOAD_BYTES {
         return None;
@@ -826,65 +900,23 @@ async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
     let res = tokio::time::timeout(
         Duration::from_secs(12),
         tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
-            let mut child = Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    "pipe:0",
-                    "-vn",
-                    "-c:a",
-                    "libvorbis",
-                    "-q:a",
-                    "5",
-                    "-f",
-                    "ogg",
-                    "pipe:1",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-
-            pid_for_task.store(child.id(), Ordering::Release);
-
-            let mut stdin = child.stdin.take()?;
-            let stdout = child.stdout.take()?;
-
-            let mut exceeded_cap = false;
-            let out = std::thread::scope(|s| {
-                let writer = s.spawn(move || {
-                    let _ = stdin.write_all(&input);
-                    drop(stdin);
-                });
-                let mut ogg = Vec::new();
-                let mut limited = stdout.take(MAX_FFMPEG_OUTPUT_BYTES + 1);
-                let read_res = limited.read_to_end(&mut ogg);
-                // Drop `stdout` immediately so if `ffmpeg` exceeded MAX_FFMPEG_OUTPUT_BYTES
-                // it receives SIGPIPE/kill instead of deadlocking `writer.join()` and `child.wait()`.
-                drop(limited);
-                if ogg.len() as u64 > MAX_FFMPEG_OUTPUT_BYTES {
-                    exceeded_cap = true;
-                    let _ = child.kill();
-                }
-                let _ = writer.join();
-                read_res.ok().map(|_| ogg)
-            });
-
-            let status = child.wait().ok();
+            let cached_mode = FFMPEG_VORBIS_MODE.load(Ordering::Relaxed);
+            let try_native_first = cached_mode == 2;
+            let result = if let Some(ogg) =
+                run_ffmpeg_vorbis_pass(&input, try_native_first, &pid_for_task)
+            {
+                FFMPEG_VORBIS_MODE.store(if try_native_first { 2 } else { 1 }, Ordering::Relaxed);
+                Some(ogg)
+            } else if let Some(ogg) =
+                run_ffmpeg_vorbis_pass(&input, !try_native_first, &pid_for_task)
+            {
+                FFMPEG_VORBIS_MODE.store(if !try_native_first { 2 } else { 1 }, Ordering::Relaxed);
+                Some(ogg)
+            } else {
+                None
+            };
             done_for_task.store(true, Ordering::Release);
-            let status = status?;
-            if exceeded_cap || !status.success() {
-                return None;
-            }
-            let ogg = out?;
-            let trimmed = trim_to_valid_ogg_pages(&ogg);
-            if trimmed.len() < 28 || &trimmed[0..4] != b"OggS" {
-                return None;
-            }
-            Some(trimmed.to_vec())
+            result
         }),
     )
     .await;
@@ -892,7 +924,6 @@ async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
     match res {
         Ok(Ok(Some(ogg))) => Some(ogg),
         Err(_) => {
-            // Timed out: terminate the child process so pipes close and the blocking thread exits.
             if !finished.load(Ordering::Acquire) {
                 let pid = child_pid.load(Ordering::Acquire);
                 if pid != 0 {
@@ -910,8 +941,7 @@ async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
 
 struct SoundCloudCandidate {
     score: i64,
-    transcode_url: String,
-    is_hls: bool,
+    transcodings: Vec<(String, bool)>,
     track_auth: String,
 }
 
@@ -942,7 +972,12 @@ fn score_soundcloud_item(
     if !title_matches(cand_title, spotify_title) {
         return None;
     }
-    if spotify_duration_ms > 0 && duration.abs_diff(spotify_duration_ms) > 25_000 {
+    let dur_diff = if spotify_duration_ms > 0 {
+        duration.abs_diff(spotify_duration_ms)
+    } else {
+        0
+    };
+    if spotify_duration_ms > 0 && dur_diff > 25_000 {
         return None;
     }
 
@@ -957,49 +992,67 @@ fn score_soundcloud_item(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let combined_haystack = format!("{cand_title} {uploader} {meta_artist}");
-    if !primary_artist.trim().is_empty() && !artist_matches(&combined_haystack, primary_artist) {
+    let has_artist_match =
+        primary_artist.trim().is_empty() || artist_matches(&combined_haystack, primary_artist);
+    let has_tight_duration_match = spotify_duration_ms > 0 && dur_diff <= 2_500;
+    if !has_artist_match && !has_tight_duration_match {
         return None;
     }
 
-    let transcodings = item
+    let raw_transcodings = item
         .get("media")
         .and_then(|m| m.get("transcodings"))
         .and_then(|t| t.as_array())?;
 
-    let progressive = transcodings.iter().find(|t| {
-        t.get("format")
+    let mut ordered_transcodings: Vec<(String, bool)> = Vec::new();
+    let mut push_tc = |t: &Value| {
+        if t.get("snipped").and_then(|s| s.as_bool()).unwrap_or(false) {
+            return;
+        }
+        let Some(url) = t.get("url").and_then(|u| u.as_str()) else {
+            return;
+        };
+        let is_hls = t
+            .get("format")
             .and_then(|f| f.get("protocol"))
             .and_then(|p| p.as_str())
-            == Some("progressive")
-    });
-    let hls_mp4 = transcodings.iter().find(|t| {
-        t.get("format")
+            == Some("hls");
+        if !ordered_transcodings.iter().any(|(u, _)| u == url) {
+            ordered_transcodings.push((url.to_string(), is_hls));
+        }
+    };
+
+    for t in raw_transcodings {
+        let is_hls_mp4 = t
+            .get("format")
             .and_then(|f| f.get("protocol"))
             .and_then(|p| p.as_str())
             == Some("hls")
             && t.get("format")
                 .and_then(|f| f.get("mime_type"))
                 .and_then(|m| m.as_str())
-                .is_some_and(|m| m.contains("mp4"))
-    });
-    let hls_any = transcodings.iter().find(|t| {
-        t.get("format")
+                .is_some_and(|m| m.contains("mp4"));
+        if is_hls_mp4 {
+            push_tc(t);
+        }
+    }
+    for t in raw_transcodings {
+        let is_prog = t
+            .get("format")
             .and_then(|f| f.get("protocol"))
             .and_then(|p| p.as_str())
-            == Some("hls")
-            && !t
-                .get("snipped")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false)
-    });
+            == Some("progressive");
+        if is_prog {
+            push_tc(t);
+        }
+    }
+    for t in raw_transcodings {
+        push_tc(t);
+    }
+    if ordered_transcodings.is_empty() {
+        return None;
+    }
 
-    let chosen = progressive.or(hls_mp4).or(hls_any)?;
-    let is_hls = chosen
-        .get("format")
-        .and_then(|f| f.get("protocol"))
-        .and_then(|p| p.as_str())
-        == Some("hls");
-    let transcode_url = chosen.get("url")?.as_str()?.to_string();
     let track_auth = item
         .get("track_authorization")
         .and_then(|v| v.as_str())
@@ -1007,11 +1060,8 @@ fn score_soundcloud_item(
         .to_string();
 
     let mut score = 0i64;
-    if !is_hls {
-        score += 10;
-    }
     if spotify_duration_ms > 0 {
-        score -= (duration.abs_diff(spotify_duration_ms) as i64) / 1000;
+        score -= (dur_diff as i64) / 1000;
     }
     if item
         .get("user")
@@ -1021,13 +1071,17 @@ fn score_soundcloud_item(
     {
         score += 30;
     }
+    if has_artist_match {
+        score += 20;
+    } else {
+        score -= 10;
+    }
     if artist_matches(uploader, primary_artist) || artist_matches(meta_artist, primary_artist) {
         score += 20;
     }
     Some(SoundCloudCandidate {
         score,
-        transcode_url,
-        is_hls,
+        transcodings: ordered_transcodings,
         track_auth,
     })
 }
@@ -1078,7 +1132,7 @@ async fn download_hls_segments(http: &HttpClient, m3u8_url: &str) -> Option<Vec<
     }
 
     let mut combined = Vec::new();
-    for batch in urls.chunks(6) {
+    for batch in urls.chunks(12) {
         let chunks = futures_util::future::join_all(
             batch.iter().map(|u| http_get_bytes(http, u)),
         )
@@ -1148,34 +1202,48 @@ async fn try_fetch_soundcloud_ogg(
     }
 
     let cand = best?;
-    let sep = if cand.transcode_url.contains('?') { '&' } else { '?' };
-    let resolve_url = if cand.track_auth.is_empty() {
-        format!("{}{}client_id={cid}", cand.transcode_url, sep)
-    } else {
-        let auth_enc: String =
-            url::form_urlencoded::byte_serialize(cand.track_auth.as_bytes()).collect();
-        format!(
-            "{}{}client_id={cid}&track_authorization={auth_enc}",
-            cand.transcode_url, sep
-        )
-    };
-    let stream_meta_bytes = http_get_bytes(http, &resolve_url).await?;
-    let stream_meta: Value = serde_json::from_slice(&stream_meta_bytes).ok()?;
-    let direct_url = stream_meta.get("url")?.as_str()?;
+    let auth_enc: String =
+        url::form_urlencoded::byte_serialize(cand.track_auth.as_bytes()).collect();
 
-    let raw_audio = if cand.is_hls || direct_url.contains(".m3u8") {
-        download_hls_segments(http, direct_url).await?
-    } else {
-        let b = http_get_bytes(http, direct_url).await?;
-        if b.len() > MAX_DOWNLOAD_BYTES {
-            return None;
+    for (transcode_url, is_hls) in cand.transcodings {
+        let sep = if transcode_url.contains('?') { '&' } else { '?' };
+        let resolve_url = if cand.track_auth.is_empty() {
+            format!("{transcode_url}{sep}client_id={cid}")
+        } else {
+            format!("{transcode_url}{sep}client_id={cid}&track_authorization={auth_enc}")
+        };
+        let Some(stream_meta_bytes) = http_get_bytes(http, &resolve_url).await else {
+            continue;
+        };
+        let Ok(stream_meta) = serde_json::from_slice::<Value>(&stream_meta_bytes) else {
+            continue;
+        };
+        let Some(direct_url) = stream_meta.get("url").and_then(|u| u.as_str()) else {
+            continue;
+        };
+
+        let raw_audio = if is_hls || direct_url.contains(".m3u8") {
+            let Some(bytes) = download_hls_segments(http, direct_url).await else {
+                continue;
+            };
+            bytes
+        } else {
+            let Some(b) = http_get_bytes(http, direct_url).await else {
+                continue;
+            };
+            if b.len() > MAX_DOWNLOAD_BYTES {
+                continue;
+            }
+            b.to_vec()
+        };
+        if raw_audio.len() < 16_000 {
+            continue;
         }
-        b.to_vec()
-    };
-    if raw_audio.len() < 16_000 {
-        return None;
+        if let Some(ogg) = ffmpeg_transcode_to_ogg(raw_audio).await {
+            return Some(ogg);
+        }
     }
-    ffmpeg_transcode_to_ogg(raw_audio).await
+    None
 }
 
 fn score_audius_item(
@@ -1618,25 +1686,16 @@ pub async fn ensure_track_playable_in_cache(session: &Session, track_uri_str: &s
 
     if !AUDIO_KEY_REJECTED.load(Ordering::Relaxed) {
         let key_res = tokio::time::timeout(
-            Duration::from_millis(3000),
+            Duration::from_millis(800),
             session.audio_key().request(key_track_id, first_fid),
         )
         .await;
-        match key_res {
-            Ok(Ok(_key)) => {
-                mark_track_staged_in_memory(track_uri_str);
-                guard.complete();
-                return;
-            }
-            Ok(Err(_)) => {
-                // Explicit AP audio key rejection: switch to fallback audio staging.
-                AUDIO_KEY_REJECTED.store(true, Ordering::Relaxed);
-            }
-            Err(_) => {
-                // Transient timeout: do not permanently poison AUDIO_KEY_REJECTED for the session.
-                return;
-            }
+        if let Ok(Ok(_key)) = key_res {
+            mark_track_staged_in_memory(track_uri_str);
+            guard.complete();
+            return;
         }
+        AUDIO_KEY_REJECTED.store(true, Ordering::Relaxed);
     }
 
     let spotify_title = track.name.trim().to_string();
