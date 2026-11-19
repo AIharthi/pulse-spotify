@@ -54,7 +54,11 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
     let option2 = zeroconf_card(state);
 
     let notice_or_err: Option<Element<'a, UiMsg>> = match &state.view.connection {
-        ConnectionStatus::Error(err) => Some(status_strip(err, true)),
+        ConnectionStatus::Error(err)
+            if state.dismissed_conn_error.as_deref() != Some(err.as_str()) =>
+        {
+            Some(status_strip(err, true))
+        }
         _ => state
             .view
             .notice_banner

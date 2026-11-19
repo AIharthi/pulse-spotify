@@ -10,9 +10,13 @@ use pulse_ui::bytes::Bytes;
 use pulse_ui::{CommandSendFn, CoverFetchFn, MetricsObserverFn, PulseAppLaunch};
 
 fn main() {
-    // Bound Tokio worker threads and glibc malloc arenas before allocating any runtime state.
+    // Bound Tokio worker threads, glibc malloc arenas, and static PulseAudio stream properties
+    // before spawning any runtime or UI threads.
     unsafe {
         std::env::set_var("TOKIO_WORKER_THREADS", "2");
+        std::env::set_var("PULSE_PROP_application.name", "Pulse");
+        std::env::set_var("PULSE_PROP_application.icon_name", "pulse-spotify");
+        std::env::set_var("PULSE_PROP_media.role", "music");
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
 

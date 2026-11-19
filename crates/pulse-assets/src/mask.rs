@@ -100,7 +100,7 @@ pub fn decode_and_mask_cover(
 /// Only touches pixels within the four corner squares of side `ceil(radius_px) + 1`.
 pub fn apply_rounded_corner_mask(rgba: &mut [u8], w: u32, h: u32, radius_px: f32) {
     let expected = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    if w == 0 || h == 0 || rgba.len() < expected || radius_px <= 0.0 {
+    if w == 0 || h == 0 || rgba.len() < expected || !radius_px.is_finite() || radius_px <= 0.0 {
         return;
     }
 
@@ -207,5 +207,16 @@ mod tests {
         let aa = decoded.pixels[((5 * 512 + 6) * 4 + 3) as usize];
         assert!(aa > 0 && aa < 255, "expected smooth AA alpha at (5,6), got {aa}");
         assert_eq!(decoded.pixels[((20 * 512 + 20) * 4 + 3) as usize], 255);
+    }
+
+    #[test]
+    fn zero_negative_and_nan_radius_leave_alpha_untouched() {
+        let mut pixels = vec![255u8; 16 * 16 * 4];
+        apply_rounded_corner_mask(&mut pixels, 16, 16, 0.0);
+        assert_eq!(pixels[3], 255);
+        apply_rounded_corner_mask(&mut pixels, 16, 16, -5.0);
+        assert_eq!(pixels[3], 255);
+        apply_rounded_corner_mask(&mut pixels, 16, 16, f32::NAN);
+        assert_eq!(pixels[3], 255);
     }
 }

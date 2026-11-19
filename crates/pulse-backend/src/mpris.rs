@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use mpris_server::{
     LocalPlayerInterface, LocalRootInterface, LocalServer, LoopStatus, Metadata, PlaybackRate,
@@ -14,6 +15,7 @@ use tokio::sync::mpsc;
 struct MprisSnapshot {
     is_playing: bool,
     position_ms: u32,
+    position_updated_at: Instant,
     duration_ms: u32,
     volume: f64,
     shuffle: bool,
@@ -32,6 +34,7 @@ impl Default for MprisSnapshot {
         Self {
             is_playing: false,
             position_ms: 0,
+            position_updated_at: Instant::now(),
             duration_ms: 0,
             volume: 1.0,
             shuffle: false,
@@ -48,6 +51,19 @@ impl Default for MprisSnapshot {
 }
 
 impl MprisSnapshot {
+    fn effective_position_ms(&self) -> u32 {
+        if !self.is_playing || self.track_uri.is_empty() {
+            return self.position_ms;
+        }
+        let elapsed_ms = self.position_updated_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let extrapolated = self.position_ms.saturating_add(elapsed_ms);
+        if self.duration_ms > 0 {
+            extrapolated.min(self.duration_ms)
+        } else {
+            extrapolated
+        }
+    }
+
     fn playback_status(&self) -> PlaybackStatus {
         if self.track_uri.is_empty() {
             PlaybackStatus::Stopped
@@ -182,29 +198,33 @@ impl LocalPlayerInterface for PulseMprisImp {
     }
 
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
-        let s = self.state.borrow();
+        let mut s = self.state.borrow_mut();
         if !s.media_keys_enabled {
             return Ok(());
         }
-        let target = (s.position_ms as i64).saturating_add(offset.as_millis()).max(0) as u64;
+        let current_pos = s.effective_position_ms();
+        let target = (current_pos as i64).saturating_add(offset.as_millis()).max(0) as u64;
         let clamped = if s.duration_ms > 0 {
             target.min(s.duration_ms as u64)
         } else {
             target
         };
+        let target_ms = clamped.min(u32::MAX as u64) as u32;
+        s.position_ms = target_ms;
+        s.position_updated_at = Instant::now();
         drop(s);
-        let _ = self
-            .cmd_tx
-            .send(UiCommand::SeekMs(clamped.min(u32::MAX as u64) as u32));
+        let _ = self.cmd_tx.send(UiCommand::SeekMs(target_ms));
         Ok(())
     }
 
     async fn set_position(&self, track_id: TrackId, position: Time) -> fdo::Result<()> {
-        let s = self.state.borrow();
+        let mut s = self.state.borrow_mut();
         if !s.media_keys_enabled || track_id != s.track_id {
             return Ok(());
         }
         let pos_ms = position.as_millis().clamp(0, u32::MAX as i64) as u32;
+        s.position_ms = pos_ms;
+        s.position_updated_at = Instant::now();
         drop(s);
         let _ = self.cmd_tx.send(UiCommand::SeekMs(pos_ms));
         Ok(())
@@ -256,7 +276,7 @@ impl LocalPlayerInterface for PulseMprisImp {
     }
 
     async fn set_loop_status(&self, loop_status: LoopStatus) -> mpris_server::zbus::Result<()> {
-        let s = self.state.borrow();
+        let mut s = self.state.borrow_mut();
         if !s.media_keys_enabled {
             return Ok(());
         }
@@ -266,6 +286,7 @@ impl LocalPlayerInterface for PulseMprisImp {
             LoopStatus::Track => RepeatMode::Track,
         };
         let mut current = s.repeat;
+        s.repeat = desired;
         drop(s);
 
         // `UiCommand::CycleRepeat` cycles Off -> Context -> Track -> Off.
@@ -292,8 +313,9 @@ impl LocalPlayerInterface for PulseMprisImp {
     }
 
     async fn set_shuffle(&self, shuffle: bool) -> mpris_server::zbus::Result<()> {
-        let s = self.state.borrow();
+        let mut s = self.state.borrow_mut();
         if s.media_keys_enabled && s.shuffle != shuffle {
+            s.shuffle = shuffle;
             drop(s);
             let _ = self.cmd_tx.send(UiCommand::ToggleShuffle);
         }
@@ -315,7 +337,7 @@ impl LocalPlayerInterface for PulseMprisImp {
     }
 
     async fn position(&self) -> fdo::Result<Time> {
-        Ok(Time::from_millis(self.state.borrow().position_ms as i64))
+        Ok(Time::from_millis(self.state.borrow().effective_position_ms() as i64))
     }
 
     async fn minimum_rate(&self) -> fdo::Result<PlaybackRate> {
@@ -410,6 +432,13 @@ impl MprisController {
         }
     }
 
+    /// Lightweight position update called on playback position ticks without emitting D-Bus signals.
+    pub fn update_position(&self, position_ms: u32) {
+        let mut s = self.state.borrow_mut();
+        s.position_ms = position_ms;
+        s.position_updated_at = Instant::now();
+    }
+
     /// Syncs changed [`PlayerState`] properties and D-Bus signals.
     pub async fn sync_player_state(&self, player: &PlayerState, seeked: bool) {
         let prev = self.state.borrow().clone();
@@ -443,6 +472,7 @@ impl MprisController {
         let next = MprisSnapshot {
             is_playing: player.is_playing,
             position_ms: player.position_ms,
+            position_updated_at: Instant::now(),
             duration_ms: player.duration_ms,
             volume: new_vol,
             shuffle: player.shuffle,
@@ -472,6 +502,7 @@ impl MprisController {
         if prev.track_uri != next.track_uri
             || prev.title != next.title
             || prev.artist != next.artist
+            || prev.album != next.album
             || prev.cover_url != next.cover_url
             || prev.duration_ms != next.duration_ms
         {

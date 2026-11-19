@@ -9,11 +9,13 @@ use pulse_model::{
     TrackSummary,
 };
 use serde_json::json;
-use spotatui_librespot_core::Session;
+use spotatui_librespot_core::{Session, version};
 use spotatui_librespot_protocol::connect::{
-    Cluster, Device, DeviceInfo as ProtoDeviceInfo, MemberType, PutStateReason, PutStateRequest,
+    Capabilities, Cluster, Device, DeviceInfo as ProtoDeviceInfo, MemberType, PutStateReason,
+    PutStateRequest,
 };
 use spotatui_librespot_protocol::devices::DeviceType;
+use spotatui_librespot_protocol::media::AudioQuality;
 use spotatui_librespot_protocol::player::{PlayerState as ProtoPlayerState, ProvidedTrack};
 
 /// Extracted remote Connect queue metadata required for `set_queue` mutations.
@@ -93,18 +95,46 @@ pub async fn refresh_cluster_passive(
     session: &Session,
     device_id: &str,
     config: &AppConfig,
+    current_volume: u16,
 ) -> Result<Cluster, String> {
     let conn_id = session.connection_id();
     if conn_id.is_empty() {
         return Err("Connect dealer connection ID not yet ready".to_string());
     }
 
+    let mut caps = Capabilities::new();
+    caps.volume_steps = 64;
+    caps.disable_volume = false;
+    caps.gaia_eq_connect_id = true;
+    caps.can_be_player = true;
+    caps.needs_full_player_state = true;
+    caps.is_observable = true;
+    caps.is_controllable = true;
+    caps.hidden = false;
+    caps.supports_gzip_pushes = true;
+    caps.supports_logout = false;
+    caps.supported_types = vec![
+        "audio/episode".into(),
+        "audio/track".into(),
+        "audio/local".into(),
+    ];
+    caps.supports_playlist_v2 = true;
+    caps.supports_transfer_command = true;
+    caps.supports_command_request = true;
+    caps.supports_set_options_command = true;
+    caps.supported_audio_quality = AudioQuality::VERY_HIGH.into();
+    caps.command_acks = true;
+
     let mut device_info = ProtoDeviceInfo::new();
     device_info.can_play = true;
+    device_info.volume = current_volume.into();
     device_info.name = config.device_name.clone();
     device_info.device_id = device_id.to_string();
     device_info.client_id = session.client_id();
     device_info.device_type = DeviceType::COMPUTER.into();
+    device_info.device_software_version = version::SEMVER.to_string();
+    device_info.spirc_version = version::SPOTIFY_SPIRC_VERSION.to_string();
+    device_info.capabilities = Some(caps).into();
 
     let mut device = Device::new();
     device.device_info = Some(device_info).into();
@@ -141,15 +171,26 @@ pub fn devices_from_cluster(
 
     let mut available_devices: Vec<ModelDeviceInfo> = cluster
         .device
-        .values()
-        .map(|d| {
-            let id = d.device_id.clone();
+        .iter()
+        .filter(|(_, d)| {
+            !d.is_offline && !d.capabilities.as_ref().is_some_and(|c| c.hidden)
+        })
+        .map(|(map_key, d)| {
+            let id = if d.device_id.is_empty() {
+                map_key.clone()
+            } else {
+                d.device_id.clone()
+            };
             let is_active = active_device_id.as_deref() == Some(id.as_str());
             let is_local = id == local_device_id;
-            let (supports_volume, is_restricted) = match d.capabilities.as_ref() {
+            let (supports_volume, caps_restricted) = match d.capabilities.as_ref() {
                 Some(caps) => (!caps.disable_volume, !caps.is_controllable),
                 None => (true, false),
             };
+            let is_restricted = caps_restricted
+                || !d.can_play
+                || !d.disallow_playback_reasons.is_empty()
+                || !d.disallow_transfer_reasons.is_empty();
             ModelDeviceInfo {
                 id,
                 name: d.name.clone(),
@@ -158,7 +199,7 @@ pub fn devices_from_cluster(
                 is_local,
                 volume: d.volume.min(65535) as u16,
                 supports_volume,
-                is_restricted: is_restricted || !d.disallow_playback_reasons.is_empty(),
+                is_restricted,
             }
         })
         .collect();
@@ -254,7 +295,12 @@ fn extract_player_state(
     let context_name = ps
         .context_metadata
         .get("context_description")
-        .or_else(|| ps.context_metadata.get("title"))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            ps.context_metadata
+                .get("title")
+                .filter(|s| !s.trim().is_empty())
+        })
         .cloned()
         .unwrap_or_else(|| {
             context_uri
@@ -300,12 +346,19 @@ fn extract_player_state(
 }
 
 fn provided_cover(t: &ProvidedTrack) -> Option<ImageRef> {
-    t.metadata
-        .get("image_xlarge_url")
-        .or_else(|| t.metadata.get("image_large_url"))
-        .or_else(|| t.metadata.get("image_url"))
-        .or_else(|| t.metadata.get("image_small_url"))
-        .and_then(|s| image_ref_from_raw(s))
+    [
+        "image_xlarge_url",
+        "image_large_url",
+        "image_url",
+        "image_small_url",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        t.metadata
+            .get(key)
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| image_ref_from_raw(s))
+    })
 }
 
 fn track_summary_from_provided(t: &ProvidedTrack) -> TrackSummary {

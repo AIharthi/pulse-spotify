@@ -133,9 +133,10 @@ fn view_now_playing_deck<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
         .as_ref()
         .and_then(|c| state.covers.best_for(&c.id));
 
+    let deck_cover = (state.window_size.height - 500.0).clamp(96.0, 220.0);
     let sleeve_btn = button(widgets::cover_hero(
         cover_handle,
-        220.0,
+        deck_cover,
         theme::RADIUS_XL,
         Some(icons::MUSIC_NOTE),
     ))
@@ -143,24 +144,25 @@ fn view_now_playing_deck<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
     .style(theme::plain_interactive_button)
     .on_press(UiMsg::SwitchMode(AppMode::FocusStage));
 
+    let glow = deck_cover + 28.0;
     let sleeve_with_glow: Element<'a, UiMsg> = match state.covers.radial_tint() {
         Some(tint) => stack![
             container(
                 iced::widget::image(tint)
-                    .width(Length::Fixed(248.0))
-                    .height(Length::Fixed(248.0))
+                    .width(Length::Fixed(glow))
+                    .height(Length::Fixed(glow))
             )
             .center_x(Length::Fill)
-            .center_y(Length::Fixed(236.0)),
+            .center_y(Length::Fixed(deck_cover + 16.0)),
             container(sleeve_btn)
                 .center_x(Length::Fill)
-                .center_y(Length::Fixed(236.0)),
+                .center_y(Length::Fixed(deck_cover + 16.0)),
         ]
         .into(),
         None => container(sleeve_btn)
             .center_x(Length::Fill)
-            .height(Length::Fixed(228.0))
-            .center_y(Length::Fixed(228.0))
+            .height(Length::Fixed(deck_cover + 8.0))
+            .center_y(Length::Fixed(deck_cover + 8.0))
             .into(),
     };
 
@@ -544,17 +546,21 @@ pub fn view_queue_panel<'a>(state: &'a UiState, row_height: f32) -> Element<'a, 
     }
 
     let overscan_px = row_height * 4.0;
-    let vis_top = (state.queue_scroll_y - overscan_px).max(0.0);
-    let vis_bot = state.queue_scroll_y + state.queue_viewport_height.max(300.0) + overscan_px;
+    let vp_h = state.queue_viewport_height.max(120.0);
+    let max_scroll = (cursor_y - vp_h).max(0.0);
+    let scroll_y = state.queue_scroll_y.clamp(0.0, max_scroll);
+    let vis_top = (scroll_y - overscan_px).max(0.0);
+    let vis_bot = scroll_y + vp_h.max(300.0) + overscan_px;
 
     let first_idx = entries
         .iter()
         .position(|e| e.y + e.h >= vis_top)
-        .unwrap_or(entries.len());
+        .unwrap_or(entries.len().saturating_sub(1));
     let last_idx = entries
         .iter()
         .rposition(|e| e.y <= vis_bot)
-        .map_or(first_idx, |i| i + 1);
+        .map_or(first_idx, |i| i + 1)
+        .max(first_idx);
 
     let top_spacer = entries.get(first_idx).map_or(0.0, |e| e.y);
     let rendered_end_y = if last_idx > first_idx {
@@ -756,9 +762,10 @@ fn queue_manual_row<'a>(
         .on_press(UiMsg::SelectQueueRow(queue_idx))
         .on_double_click(UiMsg::Command(UiCommand::PlayQueueIndex(queue_idx)))
         .on_right_press(UiMsg::OpenTrackContextMenu {
+            pane: ActivePane::Queue,
             index: queue_idx,
             track: track.clone(),
-            pos: state.cursor_pos,
+            pos: iced::Point::ORIGIN,
         });
     if state.dragging_queue_from.is_some() {
         area = area.on_release(UiMsg::DragQueueDrop(manual_idx));
@@ -846,9 +853,10 @@ fn queue_context_row<'a>(
         .on_press(UiMsg::SelectQueueRow(queue_idx))
         .on_double_click(UiMsg::Command(UiCommand::PlayQueueIndex(queue_idx)))
         .on_right_press(UiMsg::OpenTrackContextMenu {
+            pane: ActivePane::Queue,
             index: queue_idx,
             track: track.clone(),
-            pos: state.cursor_pos,
+            pos: iced::Point::ORIGIN,
         });
     if state.dragging_queue_from.is_some() {
         area = area.on_release(UiMsg::DragQueueDrop(manual_len));

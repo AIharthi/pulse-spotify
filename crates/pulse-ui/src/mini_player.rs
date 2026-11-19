@@ -190,7 +190,7 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
         .first()
         .or_else(|| state.view.queue.context_items.first());
     let next_line_text = match next_track {
-        Some(next) if player.is_playing || state.hovered_track_row.is_some() => {
+        Some(next) if player.is_playing || state.mini_player_hovered => {
             format!("Next: {} — {}", next.title, next.artist)
         }
         Some(next) => format!("Up next: {}", next.title),
@@ -242,7 +242,7 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
         .style(theme::mini_player_frame);
 
     mouse_area(card)
-        .on_enter(UiMsg::HoverTrackRow(Some(0)))
-        .on_exit(UiMsg::HoverTrackRow(None))
+        .on_enter(UiMsg::HoverMiniPlayer(true))
+        .on_exit(UiMsg::HoverMiniPlayer(false))
         .into()
 }

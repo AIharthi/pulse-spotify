@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -28,7 +28,7 @@ use url::form_urlencoded;
 
 use crate::auth::refresh_web_api_token;
 use crate::config::{
-    AppPaths, RecentHistory, WebApiToken, prune_dir_to_bytes_lru, save_web_api_token,
+    AppPaths, RecentHistory, WebApiToken, prune_dir_to_bytes_lru, save_web_api_token, write_atomic,
 };
 use crate::connect::image_ref_from_raw;
 use crate::telemetry::dir_size_bytes;
@@ -54,6 +54,7 @@ pub struct LibraryService {
     saved_albums: Option<Vec<CollectionStub>>,
     followed_artists: Option<Vec<CollectionStub>>,
     playlists_index: Option<Vec<PlaylistSummary>>,
+    recent_tracks_cache: Vec<TrackSummary>,
     track_cache: HashMap<String, TrackSummary>,
     track_cache_order: VecDeque<String>,
     album_cache: HashMap<String, AlbumSummary>,
@@ -97,6 +98,7 @@ impl LibraryService {
             saved_albums: None,
             followed_artists: None,
             playlists_index: None,
+            recent_tracks_cache: Vec::new(),
             track_cache: HashMap::new(),
             track_cache_order: VecDeque::new(),
             album_cache: HashMap::new(),
@@ -111,6 +113,7 @@ impl LibraryService {
         self.saved_albums = None;
         self.followed_artists = None;
         self.playlists_index = None;
+        self.recent_tracks_cache.clear();
         self.track_cache.clear();
         self.track_cache_order.clear();
         self.album_cache.clear();
@@ -157,9 +160,7 @@ impl LibraryService {
             if let Some(cached) = self.track_cache.get(&stub.uri) {
                 let mut item = cached.clone();
                 item.is_liked = self.liked_uri_set.contains(&stub.uri);
-                if stub.added_at > 0 {
-                    item.added_at_unix = Some(stub.added_at as i64);
-                }
+                item.added_at_unix = (stub.added_at > 0).then_some(stub.added_at as i64);
                 out[idx] = Some(item);
             } else {
                 missing_positions.push(idx);
@@ -376,20 +377,23 @@ impl LibraryService {
         let mut stubs = self.liked_tracks.clone().unwrap_or_default();
         stubs.sort_by_key(|a| std::cmp::Reverse(a.added_at));
 
-        let total = stubs.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit.max(1)).min(total);
-
-        let items = if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
-            let mut all_items = self.resolve_track_summaries_cached(session, &stubs).await;
-            sort_track_summaries(&mut all_items, sort);
-            let s = offset.min(all_items.len());
-            let e = s.saturating_add(limit.max(1)).min(all_items.len());
-            all_items[s..e].to_vec()
-        } else {
-            self.resolve_track_summaries_cached(session, &stubs[start..end])
-                .await
-        };
+        let (total, start, items) =
+            if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
+                let mut all_items = self.resolve_track_summaries_cached(session, &stubs).await;
+                sort_track_summaries(&mut all_items, sort);
+                let resolved_total = all_items.len();
+                let s = offset.min(resolved_total);
+                let e = s.saturating_add(limit.max(1)).min(resolved_total);
+                (resolved_total, s, all_items[s..e].to_vec())
+            } else {
+                let total = stubs.len();
+                let start = offset.min(total);
+                let end = start.saturating_add(limit.max(1)).min(total);
+                let items = self
+                    .resolve_track_summaries_cached(session, &stubs[start..end])
+                    .await;
+                (total, start, items)
+            };
 
         let mut events = Vec::new();
         if start == 0 {
@@ -420,21 +424,27 @@ impl LibraryService {
         self.ensure_collection_loaded(session).await?;
         let mut stubs = self.saved_albums.clone().unwrap_or_default();
         stubs.sort_by_key(|a| std::cmp::Reverse(a.added_at));
-        let total = stubs.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit.max(1)).min(total);
 
-        let items = if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
-            let all_uris: Vec<String> = stubs.iter().map(|s| s.uri.clone()).collect();
-            let mut all_items = self.resolve_album_summaries_cached(session, &all_uris).await;
-            sort_album_summaries(&mut all_items, sort);
-            let s = offset.min(all_items.len());
-            let e = s.saturating_add(limit.max(1)).min(all_items.len());
-            all_items[s..e].to_vec()
-        } else {
-            let slice_uris: Vec<String> = stubs[start..end].iter().map(|s| s.uri.clone()).collect();
-            self.resolve_album_summaries_cached(session, &slice_uris).await
-        };
+        let (total, start, items) =
+            if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
+                let all_uris: Vec<String> = stubs.iter().map(|s| s.uri.clone()).collect();
+                let mut all_items = self.resolve_album_summaries_cached(session, &all_uris).await;
+                sort_album_summaries(&mut all_items, sort);
+                let resolved_total = all_items.len();
+                let s = offset.min(resolved_total);
+                let e = s.saturating_add(limit.max(1)).min(resolved_total);
+                (resolved_total, s, all_items[s..e].to_vec())
+            } else {
+                let total = stubs.len();
+                let start = offset.min(total);
+                let end = start.saturating_add(limit.max(1)).min(total);
+                let slice_uris: Vec<String> =
+                    stubs[start..end].iter().map(|s| s.uri.clone()).collect();
+                let items = self
+                    .resolve_album_summaries_cached(session, &slice_uris)
+                    .await;
+                (total, start, items)
+            };
 
         let mut events = Vec::new();
         if start == 0 {
@@ -494,47 +504,61 @@ impl LibraryService {
         sort: SortOrder,
     ) -> Result<Vec<BackendEvent>, String> {
         if self.playlists_index.is_none() {
-            let rootlist = session
-                .spclient()
-                .get_rootlist(0, Some(200))
-                .await
-                .map_err(|e| format!("failed to fetch playlists rootlist: {e}"))?;
-
-            let proto_list = ProtoSelectedListContent::parse_from_bytes(&rootlist)
-                .map_err(|e| format!("failed to parse rootlist protobuf: {e}"))?;
-
             let mut stubs = Vec::new();
             let mut seen = HashSet::new();
-            for (idx, item) in proto_list.contents.items.iter().enumerate() {
-                let Some(uri) = normalize_playlist_uri(item.uri()) else {
-                    continue;
-                };
-                if !seen.insert(uri.clone()) {
-                    continue;
-                }
-                let meta = proto_list.contents.meta_items.get(idx);
-                let (name, owner, track_count, cover, is_collaborative) = match meta {
-                    Some(m) => {
-                        let attrs = m.attributes.get_or_default();
-                        (
-                            attrs.name().trim().to_string(),
-                            m.owner_username().trim().to_string(),
-                            m.length().max(0) as usize,
-                            proto_playlist_cover(attrs),
-                            attrs.collaborative(),
-                        )
+            let mut root_offset = 0usize;
+            const ROOTLIST_PAGE: usize = 200;
+
+            for _ in 0..50 {
+                let rootlist = session
+                    .spclient()
+                    .get_rootlist(root_offset, Some(ROOTLIST_PAGE))
+                    .await
+                    .map_err(|e| format!("failed to fetch playlists rootlist: {e}"))?;
+
+                let proto_list = ProtoSelectedListContent::parse_from_bytes(&rootlist)
+                    .map_err(|e| format!("failed to parse rootlist protobuf: {e}"))?;
+
+                let page_count = proto_list.contents.items.len();
+                for (idx, item) in proto_list.contents.items.iter().enumerate() {
+                    let Some(uri) = normalize_playlist_uri(item.uri()) else {
+                        continue;
+                    };
+                    if !seen.insert(uri.clone()) {
+                        continue;
                     }
-                    None => (String::new(), String::new(), 0, None, false),
-                };
-                stubs.push(PlaylistSummary {
-                    uri: Arc::from(uri.as_str()),
-                    name,
-                    owner: Arc::from(owner.as_str()),
-                    track_count,
-                    total_duration_ms: 0,
-                    cover,
-                    is_collaborative,
-                });
+                    let meta = proto_list.contents.meta_items.get(idx);
+                    let (name, owner, track_count, cover, is_collaborative) = match meta {
+                        Some(m) => {
+                            let attrs = m.attributes.get_or_default();
+                            (
+                                attrs.name().trim().to_string(),
+                                m.owner_username().trim().to_string(),
+                                m.length().max(0) as usize,
+                                proto_playlist_cover(attrs),
+                                attrs.collaborative(),
+                            )
+                        }
+                        None => (String::new(), String::new(), 0, None, false),
+                    };
+                    stubs.push(PlaylistSummary {
+                        uri: Arc::from(uri.as_str()),
+                        name,
+                        owner: Arc::from(owner.as_str()),
+                        track_count,
+                        total_duration_ms: 0,
+                        cover,
+                        is_collaborative,
+                    });
+                }
+
+                root_offset = root_offset.saturating_add(page_count);
+                let total_len = proto_list.length().max(0) as usize;
+                let has_more = proto_list.contents.truncated()
+                    || (total_len > 0 && root_offset < total_len);
+                if page_count == 0 || !has_more {
+                    break;
+                }
             }
             self.playlists_index = Some(stubs);
         }
@@ -613,20 +637,23 @@ impl LibraryService {
         let playlist = fetch_proto_playlist(session, uri_str).await?;
         let all_stubs = playlist_track_stubs(&playlist, sort);
 
-        let total = all_stubs.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit.max(1)).min(total);
-
-        let items = if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
-            let mut all_items = self.resolve_track_summaries_cached(session, &all_stubs).await;
-            sort_track_summaries(&mut all_items, sort);
-            let s = offset.min(all_items.len());
-            let e = s.saturating_add(limit.max(1)).min(all_items.len());
-            all_items[s..e].to_vec()
-        } else {
-            self.resolve_track_summaries_cached(session, &all_stubs[start..end])
-                .await
-        };
+        let (total, start, items) =
+            if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
+                let mut all_items = self.resolve_track_summaries_cached(session, &all_stubs).await;
+                sort_track_summaries(&mut all_items, sort);
+                let resolved_total = all_items.len();
+                let s = offset.min(resolved_total);
+                let e = s.saturating_add(limit.max(1)).min(resolved_total);
+                (resolved_total, s, all_items[s..e].to_vec())
+            } else {
+                let total = all_stubs.len();
+                let start = offset.min(total);
+                let end = start.saturating_add(limit.max(1)).min(total);
+                let items = self
+                    .resolve_track_summaries_cached(session, &all_stubs[start..end])
+                    .await;
+                (total, start, items)
+            };
 
         let attrs = playlist.attributes.get_or_default();
         let cover = proto_playlist_cover(attrs);
@@ -676,19 +703,23 @@ impl LibraryService {
                 });
             }
         }
-        let total = all_stubs.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit.max(1)).min(total);
-        let items = if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
-            let mut all_items = self.resolve_track_summaries_cached(session, &all_stubs).await;
-            sort_track_summaries(&mut all_items, sort);
-            let s = offset.min(all_items.len());
-            let e = s.saturating_add(limit.max(1)).min(all_items.len());
-            all_items[s..e].to_vec()
-        } else {
-            self.resolve_track_summaries_cached(session, &all_stubs[start..end])
-                .await
-        };
+        let (total, start, items) =
+            if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
+                let mut all_items = self.resolve_track_summaries_cached(session, &all_stubs).await;
+                sort_track_summaries(&mut all_items, sort);
+                let resolved_total = all_items.len();
+                let s = offset.min(resolved_total);
+                let e = s.saturating_add(limit.max(1)).min(resolved_total);
+                (resolved_total, s, all_items[s..e].to_vec())
+            } else {
+                let total = all_stubs.len();
+                let start = offset.min(total);
+                let end = start.saturating_add(limit.max(1)).min(total);
+                let items = self
+                    .resolve_track_summaries_cached(session, &all_stubs[start..end])
+                    .await;
+                (total, start, items)
+            };
 
         let artist_names: Vec<&str> = album.artists.0.iter().map(|a| a.name.as_str()).collect();
         let year = album.date.0.year();
@@ -794,8 +825,9 @@ impl LibraryService {
                 .spclient()
                 .collection_contains("collection", &[uri_str])
                 .await
-                .ok()
-                .and_then(|v| v.first().copied())
+                .map_err(|e| format!("failed to check Spotify liked state: {e}"))?
+                .first()
+                .copied()
                 .unwrap_or(false)
         };
         let target_liked = !currently_liked;
@@ -855,8 +887,8 @@ impl LibraryService {
         sort: SortOrder,
     ) -> Result<Vec<BackendEvent>, String> {
         let _ = self.ensure_collection_loaded(session).await;
-        let mut items: Vec<TrackSummary> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut by_uri: HashMap<String, TrackSummary> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
 
         if let Some(token) = web_token.as_mut()
             && ensure_fresh_web_token(session.http_client(), paths, token)
@@ -874,18 +906,37 @@ impl LibraryService {
                 let Some(track) = item.get("track") else {
                     continue;
                 };
-                if let Some(ts) = track_summary_from_web_api(track, &self.liked_uri_set)
-                    && seen.insert(ts.uri.to_string())
-                {
-                    items.push(ts);
+                if let Some(mut ts) = track_summary_from_web_api(track, &self.liked_uri_set) {
+                    let played_at = item
+                        .get("played_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_iso8601_unix_secs);
+                    ts.added_at_unix = played_at;
+                    let key = ts.uri.to_string();
+                    if let std::collections::hash_map::Entry::Vacant(e) = by_uri.entry(key.clone()) {
+                        order.push(key);
+                        e.insert(ts);
+                    }
                 }
             }
         }
 
-        // Supplement with local playback history persisted across runs.
+        // Supplement with local playback history persisted across runs, keeping the newer timestamp.
         for entry in &local_recent.entries {
-            if entry.uri.starts_with("spotify:track:") && seen.insert(entry.uri.clone()) {
-                items.push(TrackSummary {
+            if !entry.uri.starts_with("spotify:track:") {
+                continue;
+            }
+            let local_ts = entry.played_at_secs as i64;
+            if let Some(existing) = by_uri.get_mut(&entry.uri) {
+                if existing.added_at_unix.unwrap_or(0) < local_ts {
+                    existing.added_at_unix = Some(local_ts);
+                }
+                continue;
+            }
+            order.push(entry.uri.clone());
+            by_uri.insert(
+                entry.uri.clone(),
+                TrackSummary {
                     uri: Arc::from(entry.uri.as_str()),
                     title: entry.title.clone(),
                     artist: Arc::from(entry.subtitle.as_str()),
@@ -896,10 +947,18 @@ impl LibraryService {
                     duration_ms: entry.duration_ms,
                     is_liked: self.liked_uri_set.contains(&entry.uri),
                     is_playable: true,
-                    added_at_unix: Some(entry.played_at_secs as i64),
-                });
-            }
+                    added_at_unix: Some(local_ts),
+                },
+            );
         }
+
+        let mut items: Vec<TrackSummary> = order
+            .into_iter()
+            .filter_map(|u| by_uri.remove(&u))
+            .collect();
+        // Sort descending by played_at timestamp so recent local and remote plays interleave accurately.
+        items.sort_by_key(|t| std::cmp::Reverse(t.added_at_unix.unwrap_or(0)));
+        self.recent_tracks_cache = items.clone();
 
         if matches!(sort, SortOrder::Title | SortOrder::Artist | SortOrder::Duration) {
             sort_track_summaries(&mut items, sort);
@@ -1039,16 +1098,38 @@ impl LibraryService {
                 Ok(("Liked Songs".to_string(), None, tracks))
             }
             CrateRef::Recent => {
-                let stubs: Vec<CollectionStub> = recent
-                    .entries
-                    .iter()
-                    .filter(|e| e.uri.starts_with("spotify:track:"))
-                    .map(|e| CollectionStub {
-                        uri: e.uri.clone(),
-                        added_at: e.played_at_secs.min(i32::MAX as u64) as i32,
-                    })
-                    .collect();
-                let mut tracks = self.resolve_track_summaries_cached(session, &stubs).await;
+                let mut tracks = if !self.recent_tracks_cache.is_empty() {
+                    let mut cached = self.recent_tracks_cache.clone();
+                    let mut seen: HashSet<String> =
+                        cached.iter().map(|t| t.uri.to_string()).collect();
+                    let extra_stubs: Vec<CollectionStub> = recent
+                        .entries
+                        .iter()
+                        .filter(|e| {
+                            e.uri.starts_with("spotify:track:") && seen.insert(e.uri.clone())
+                        })
+                        .map(|e| CollectionStub {
+                            uri: e.uri.clone(),
+                            added_at: e.played_at_secs.min(i32::MAX as u64) as i32,
+                        })
+                        .collect();
+                    if !extra_stubs.is_empty() {
+                        cached.extend(self.resolve_track_summaries_cached(session, &extra_stubs).await);
+                        cached.sort_by_key(|t| std::cmp::Reverse(t.added_at_unix.unwrap_or(0)));
+                    }
+                    cached
+                } else {
+                    let stubs: Vec<CollectionStub> = recent
+                        .entries
+                        .iter()
+                        .filter(|e| e.uri.starts_with("spotify:track:"))
+                        .map(|e| CollectionStub {
+                            uri: e.uri.clone(),
+                            added_at: e.played_at_secs.min(i32::MAX as u64) as i32,
+                        })
+                        .collect();
+                    self.resolve_track_summaries_cached(session, &stubs).await
+                };
                 sort_track_summaries(&mut tracks, sort);
                 Ok(("Recently Played".to_string(), None, tracks))
             }
@@ -1192,16 +1273,26 @@ pub async fn fetch_cover_bytes(
 
     let cache_enabled = config.disk_cover_cache_mb > 0;
     let cache_path = cover_disk_path(paths, trimmed);
-    if cache_enabled && let Ok(bytes) = fs::read(&cache_path) {
-        return Ok(bytes);
+    if cache_enabled {
+        let read_path = cache_path.clone();
+        let cached = tokio::task::spawn_blocking(move || read_valid_cover_disk_cache(&read_path))
+            .await
+            .ok()
+            .flatten();
+        if let Some(bytes) = cached {
+            return Ok(bytes);
+        }
     }
 
     let bytes = if let Some(image_hex) = extract_spotify_image_id(trimmed) {
         if let Some(sess) = session
             && let Some(raw_id) = decode_hex(&image_hex)
+            && raw_id.len() == 20
             && let Ok(raw) = sess.spclient().get_image(&FileId::from_raw(&raw_id)).await
         {
             raw.to_vec()
+        } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            http_get_bytes(http, trimmed).await?
         } else {
             http_get_bytes(http, &format!("https://i.scdn.co/image/{image_hex}")).await?
         }
@@ -1211,19 +1302,42 @@ pub async fn fetch_cover_bytes(
         return Err(format!("unsupported cover URL/ID: {trimmed}"));
     };
 
+    if bytes.is_empty() {
+        return Err(format!("empty cover response for {trimmed}"));
+    }
+
     if cache_enabled {
-        let _ = write_cover_disk_cache(paths, config.disk_cover_cache_mb, &cache_path, &bytes);
+        let cover_dir = paths.cover_cache_dir.clone();
+        let limit_mb = config.disk_cover_cache_mb;
+        let bytes_for_disk = bytes.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = write_cover_disk_cache(&cover_dir, limit_mb, &cache_path, &bytes_for_disk);
+        })
+        .await;
     }
     Ok(bytes)
+}
+
+fn read_valid_cover_disk_cache(path: &PathBuf) -> Option<Vec<u8>> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 12 {
+        let _ = fs::remove_file(path);
+        return None;
+    }
+    // Touch mtime on hit so `prune_dir_to_bytes_lru` evicts in true LRU order rather than FIFO.
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+    Some(bytes)
 }
 
 async fn http_get_bytes(http: &HttpClient, url: &str) -> Result<Vec<u8>, String> {
     let req = Request::get(url)
         .body(Bytes::new())
         .map_err(|e| format!("invalid image request URL {url}: {e}"))?;
-    let body = http
-        .request_body(req)
+    let body = tokio::time::timeout(Duration::from_secs(15), http.request_body(req))
         .await
+        .map_err(|_| format!("timed out fetching cover {url}"))?
         .map_err(|e| format!("failed to fetch cover {url}: {e}"))?;
     Ok(body.to_vec())
 }
@@ -1241,6 +1355,41 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn parse_iso8601_unix_secs(s: &str) -> Option<i64> {
+    // Expected format: YYYY-MM-DDTHH:MM:SS(.fff)?Z
+    let bytes = s.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || (bytes[10] != b'T' && bytes[10] != b't') {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let min: i64 = s.get(14..16)?.parse().ok()?;
+    let sec: i64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Howard Hinnant's civil-to-days algorithm (days since 1970-01-01).
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
 fn cover_disk_path(paths: &AppPaths, key: &str) -> PathBuf {
     let digest = Sha256::digest(key.as_bytes());
     let mut name = String::with_capacity(64);
@@ -1252,23 +1401,23 @@ fn cover_disk_path(paths: &AppPaths, key: &str) -> PathBuf {
 }
 
 fn write_cover_disk_cache(
-    paths: &AppPaths,
+    cover_cache_dir: &std::path::Path,
     limit_mb: u64,
-    target: &PathBuf,
+    target: &std::path::Path,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    fs::create_dir_all(&paths.cover_cache_dir)?;
+    fs::create_dir_all(cover_cache_dir)?;
     let limit_bytes = limit_mb.saturating_mul(1024 * 1024);
     if bytes.len() as u64 > limit_bytes {
         return Ok(());
     }
-    if dir_size_bytes(&paths.cover_cache_dir).saturating_add(bytes.len() as u64) > limit_bytes {
+    if dir_size_bytes(cover_cache_dir).saturating_add(bytes.len() as u64) > limit_bytes {
         prune_dir_to_bytes_lru(
-            &paths.cover_cache_dir,
+            cover_cache_dir,
             limit_bytes.saturating_sub(bytes.len() as u64),
         );
     }
-    fs::write(target, bytes)
+    write_atomic(target, bytes, false)
 }
 
 fn extract_spotify_image_id(raw: &str) -> Option<String> {
@@ -1321,8 +1470,9 @@ async fn ensure_fresh_web_token(
         .as_secs();
     if now.saturating_add(60) >= token.expires_at_epoch_secs {
         let refreshed = refresh_web_api_token(http, token).await?;
-        save_web_api_token(paths, &refreshed).map_err(|e| e.to_string())?;
-        *token = refreshed;
+        // Update in-memory token first so a disk persistence error cannot lose a server-rotated refresh token.
+        *token = refreshed.clone();
+        let _ = save_web_api_token(paths, &refreshed);
     }
     Ok(())
 }
@@ -1332,9 +1482,9 @@ async fn web_api_get(http: &HttpClient, access_token: &str, url: &str) -> Result
         .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
         .body(Bytes::new())
         .map_err(|e| format!("failed to build Web API request: {e}"))?;
-    let body = http
-        .request_body(req)
+    let body = tokio::time::timeout(Duration::from_secs(15), http.request_body(req))
         .await
+        .map_err(|_| "Spotify Web API call timed out".to_string())?
         .map_err(|e| format!("Spotify Web API call failed: {e}"))?;
     serde_json::from_slice(&body).map_err(|e| format!("invalid Spotify Web API JSON: {e}"))
 }
@@ -1394,12 +1544,7 @@ async fn resolve_track_summaries_indexed(
     while next_idx < stubs.len() && futs.len() < METADATA_CONCURRENCY {
         let idx = next_idx;
         let stub = stubs[idx].clone();
-        futs.push(fetch_one_track_summary(
-            session,
-            idx,
-            stub,
-            liked_set.clone(),
-        ));
+        futs.push(fetch_one_track_summary(session, idx, stub, liked_set));
         next_idx += 1;
     }
 
@@ -1408,12 +1553,7 @@ async fn resolve_track_summaries_indexed(
         if next_idx < stubs.len() {
             let idx = next_idx;
             let stub = stubs[idx].clone();
-            futs.push(fetch_one_track_summary(
-                session,
-                idx,
-                stub,
-                liked_set.clone(),
-            ));
+            futs.push(fetch_one_track_summary(session, idx, stub, liked_set));
             next_idx += 1;
         }
     }
@@ -1425,7 +1565,7 @@ async fn fetch_one_track_summary(
     session: &Session,
     idx: usize,
     stub: CollectionStub,
-    liked_set: HashSet<String>,
+    liked_set: &HashSet<String>,
 ) -> (usize, Option<TrackSummary>) {
     let Ok(uri) = SpotifyUri::from_uri(&stub.uri) else {
         return (idx, None);
@@ -1667,7 +1807,7 @@ fn proto_playlist_cover(attrs: &ProtoListAttributes) -> Option<ImageRef> {
             if pic.is_empty() {
                 None
             } else {
-                let id_hex = FileId::from_raw(pic).to_base16();
+                let id_hex = encode_hex(pic);
                 let url = format!("https://i.scdn.co/image/{id_hex}");
                 Some(ImageRef {
                     id: Arc::from(id_hex.as_str()),
@@ -2187,7 +2327,10 @@ fn parse_pathfinder_search(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_playlist_uri, normalize_track_uri, proto_item_added_at_secs};
+    use super::{
+        encode_hex, normalize_playlist_uri, normalize_track_uri, parse_iso8601_unix_secs,
+        proto_item_added_at_secs,
+    };
 
     #[test]
     fn playlist_uri_normalization_accepts_user_scoped_and_skips_folders() {
@@ -2216,5 +2359,18 @@ mod tests {
         assert_eq!(proto_item_added_at_secs(1_700_000_000), 1_700_000_000);
         assert_eq!(proto_item_added_at_secs(1_700_000_000_000), 1_700_000_000);
         assert_eq!(proto_item_added_at_secs(10_000_000_000_000), 10_000_000);
+    }
+
+    #[test]
+    fn iso8601_parser_and_hex_encoding() {
+        assert_eq!(
+            parse_iso8601_unix_secs("1970-01-01T00:00:00Z"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_iso8601_unix_secs("2024-03-15T12:34:56.789Z"),
+            Some(1_710_506_096)
+        );
+        assert_eq!(encode_hex(&[0x0a, 0xff, 0x00, 0x42]), "0aff0042");
     }
 }

@@ -97,7 +97,11 @@ fn view_scope_strip<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
         .spacing(theme::SPACE_SM)
         .align_y(Vertical::Center);
 
-    if !cv.local_filter.trim().is_empty() {
+    let is_track_crate = matches!(
+        cv.active_crate,
+        CrateRef::LikedSongs | CrateRef::Recent | CrateRef::Playlist { .. } | CrateRef::Album { .. }
+    );
+    if is_track_crate && !cv.local_filter.trim().is_empty() {
         let matched = matched_filter_indices(cv).len();
         let total = cv.loaded_tracks.total().max(cv.loaded_tracks.loaded_count());
         strip = strip.push(
@@ -345,12 +349,13 @@ fn view_track_crate<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             view_filter_empty_state(filter_trimmed, cv.is_loading)
         } else {
             let total = matched.len();
-            let first = ((state.crate_scroll_y / theme::TRACK_ROW_HEIGHT).floor() as usize)
-                .saturating_sub(OVERSCAN_ROWS)
-                .min(total);
             let visible_count =
                 (state.crate_viewport_height / theme::TRACK_ROW_HEIGHT).ceil() as usize
                     + OVERSCAN_ROWS * 2;
+            let first = ((state.crate_scroll_y.max(0.0) / theme::TRACK_ROW_HEIGHT).floor()
+                as usize)
+                .saturating_sub(OVERSCAN_ROWS)
+                .min(total.saturating_sub(visible_count));
             let end = (first + visible_count).min(total);
             let top_px = first as f32 * theme::TRACK_ROW_HEIGHT;
             let bot_px = total.saturating_sub(end) as f32 * theme::TRACK_ROW_HEIGHT;
@@ -405,12 +410,13 @@ fn view_track_crate<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             .center_y(Length::Fill)
             .into()
         } else {
-            let first = ((state.crate_scroll_y / theme::TRACK_ROW_HEIGHT).floor() as usize)
-                .saturating_sub(OVERSCAN_ROWS)
-                .min(total);
             let visible_count =
                 (state.crate_viewport_height / theme::TRACK_ROW_HEIGHT).ceil() as usize
                     + OVERSCAN_ROWS * 2;
+            let first = ((state.crate_scroll_y.max(0.0) / theme::TRACK_ROW_HEIGHT).floor()
+                as usize)
+                .saturating_sub(OVERSCAN_ROWS)
+                .min(total.saturating_sub(visible_count));
             let end = (first + visible_count).min(total);
             let top_px = first as f32 * theme::TRACK_ROW_HEIGHT;
             let bot_px = total.saturating_sub(end) as f32 * theme::TRACK_ROW_HEIGHT;
@@ -691,13 +697,14 @@ fn view_track_row<'a>(
         .style(theme::row_container(is_playing_row, is_selected, is_hovered));
 
     let mut area = mouse_area(row_box)
-        .on_enter(UiMsg::HoverTrackRow(Some(idx)))
-        .on_exit(UiMsg::HoverTrackRow(None))
+        .on_enter(UiMsg::HoverTrackRowEnter(idx))
+        .on_exit(UiMsg::HoverTrackRowExit(idx))
         .on_press(UiMsg::SelectCrateRow(idx))
         .on_right_press(UiMsg::OpenTrackContextMenu {
+            pane: ActivePane::Crate,
             index: idx,
             track: track.clone(),
-            pos: state.cursor_pos,
+            pos: iced::Point::ORIGIN,
         });
 
     if track.is_playable {

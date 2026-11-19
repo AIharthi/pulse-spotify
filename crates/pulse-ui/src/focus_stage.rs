@@ -84,9 +84,18 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
 
 fn view_focus_hero<'a>(state: &'a UiState, queue_visible: bool) -> Element<'a, UiMsg> {
     let player = &state.view.player_state;
-    let cover_size = (state.window_size.height - 320.0).clamp(260.0, 420.0);
+    let pane_w = if queue_visible {
+        state.window_size.width * 0.58
+    } else {
+        state.window_size.width
+    };
+    let cover_size = (state.window_size.height - 380.0)
+        .min(pane_w - 96.0)
+        .clamp(120.0, 420.0);
 
-    let toggle_queue_btn: Option<Element<'a, UiMsg>> = if !queue_visible {
+    let toggle_queue_btn: Option<Element<'a, UiMsg>> = if !queue_visible
+        && state.window_size.width >= 900.0
+    {
         Some(
             button(
                 row![
@@ -383,9 +392,14 @@ fn view_focus_hero<'a>(state: &'a UiState, queue_visible: bool) -> Element<'a, U
         hero_col = hero_col.push(btn);
     }
 
-    container(hero_col)
-        .padding([theme::SPACE_LG, theme::SPACE_2XL])
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+    iced::widget::scrollable(
+        container(hero_col)
+            .padding([theme::SPACE_LG, theme::SPACE_2XL])
+            .width(Length::Fill)
+            .center_x(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(theme::dark_scrollable)
+    .into()
 }

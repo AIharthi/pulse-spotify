@@ -17,6 +17,8 @@ pub struct TwoTierQueue {
     context_cursor: usize,
     /// Index of the currently playing context track (when playing from context).
     current_context_index: Option<usize>,
+    /// True when the currently active track was popped from `manual` rather than `context_tracks`.
+    playing_from_manual: bool,
     /// Currently active track (whether from manual queue, context, or standalone).
     current_track: Option<TrackSummary>,
     /// URI of the active track (kept in sync even when metadata lookup hasn't resolved).
@@ -82,6 +84,11 @@ impl TwoTierQueue {
             return None;
         }
         let track = self.context_tracks.remove(abs);
+        if let Some(ref mut orig) = self.unshuffled_context
+            && let Some(pos) = orig.iter().rposition(|t| t.uri == track.uri)
+        {
+            orig.remove(pos);
+        }
         let insert_at = manual_index.min(self.manual.len());
         self.manual.insert(insert_at, track.clone());
         Some(track)
@@ -113,6 +120,7 @@ impl TwoTierQueue {
         self.context_uri = context_uri;
         self.context_tracks = tracks;
         self.unshuffled_context = None;
+        self.playing_from_manual = false;
         self.current_context_index = playing_index.filter(|&i| i < self.context_tracks.len());
         self.context_cursor = match self.current_context_index {
             Some(i) => (i + 1).min(self.context_tracks.len()),
@@ -122,6 +130,9 @@ impl TwoTierQueue {
             let track = self.context_tracks[idx].clone();
             self.current_uri = Some(track.uri.clone());
             self.current_track = Some(track);
+        } else {
+            self.current_uri = None;
+            self.current_track = None;
         }
     }
 
@@ -131,6 +142,7 @@ impl TwoTierQueue {
         self.unshuffled_context = None;
         self.context_cursor = 0;
         self.current_context_index = None;
+        self.playing_from_manual = false;
         self.context_name.clear();
         self.context_uri = None;
     }
@@ -144,6 +156,11 @@ impl TwoTierQueue {
     /// Returns `true` if shuffle ordering is currently active on the local queue.
     pub fn is_shuffled(&self) -> bool {
         self.unshuffled_context.is_some()
+    }
+
+    /// Returns total number of tracks currently tracked in manual + context queues.
+    pub fn total_context_len(&self) -> usize {
+        self.context_tracks.len()
     }
 
     /// Enables or disables local context shuffle while preserving the currently playing track
@@ -184,13 +201,20 @@ impl TwoTierQueue {
             let Some(original) = self.unshuffled_context.take() else {
                 return false;
             };
-            let active_uri = self
-                .current_track
-                .as_ref()
-                .map(|t| t.uri.clone())
-                .or_else(|| self.current_uri.clone());
+            // When playing a manual track, anchor to the last played context track rather than
+            // searching `original` for the manual track's URI.
+            let anchor_uri = if self.playing_from_manual {
+                self.current_context_index
+                    .and_then(|idx| self.context_tracks.get(idx))
+                    .map(|t| t.uri.clone())
+            } else {
+                self.current_track
+                    .as_ref()
+                    .map(|t| t.uri.clone())
+                    .or_else(|| self.current_uri.clone())
+            };
             self.context_tracks = original;
-            if let Some(uri) = active_uri
+            if let Some(uri) = anchor_uri
                 && let Some(pos) = self.context_tracks.iter().position(|t| t.uri == uri)
             {
                 self.current_context_index = Some(pos);
@@ -211,6 +235,7 @@ impl TwoTierQueue {
         if index < self.manual.len() {
             let chosen = self.manual[index].clone();
             self.manual.drain(0..=index);
+            self.playing_from_manual = true;
             self.current_uri = Some(chosen.uri.clone());
             self.current_track = Some(chosen.clone());
             return Some((chosen, true));
@@ -219,6 +244,7 @@ impl TwoTierQueue {
         let ctx_rel = index.checked_sub(self.manual.len())?;
         let abs = self.context_cursor.checked_add(ctx_rel)?;
         let chosen = self.context_tracks.get(abs)?.clone();
+        self.playing_from_manual = false;
         self.current_context_index = Some(abs);
         self.context_cursor = (abs + 1).min(self.context_tracks.len());
         self.current_uri = Some(chosen.uri.clone());
@@ -230,6 +256,7 @@ impl TwoTierQueue {
     pub fn step_next_track(&mut self, wrap_around: bool) -> Option<TrackSummary> {
         if !self.manual.is_empty() {
             let next = self.manual.remove(0);
+            self.playing_from_manual = true;
             self.current_uri = Some(next.uri.clone());
             self.current_track = Some(next.clone());
             return Some(next);
@@ -237,6 +264,7 @@ impl TwoTierQueue {
         if self.context_cursor < self.context_tracks.len() {
             let idx = self.context_cursor;
             let next = self.context_tracks[idx].clone();
+            self.playing_from_manual = false;
             self.current_context_index = Some(idx);
             self.context_cursor = (idx + 1).min(self.context_tracks.len());
             self.current_uri = Some(next.uri.clone());
@@ -245,6 +273,7 @@ impl TwoTierQueue {
         }
         if wrap_around && !self.context_tracks.is_empty() {
             let next = self.context_tracks[0].clone();
+            self.playing_from_manual = false;
             self.current_context_index = Some(0);
             self.context_cursor = 1.min(self.context_tracks.len());
             self.current_uri = Some(next.uri.clone());
@@ -259,7 +288,11 @@ impl TwoTierQueue {
         if let Some(cur) = self.current_context_index
             && !self.context_tracks.is_empty()
         {
-            let prev_idx = if cur > 0 {
+            // If currently playing a manual track, stepping back returns to the context track
+            // that was playing right before the manual track instead of skipping over it.
+            let prev_idx = if self.playing_from_manual {
+                cur.min(self.context_tracks.len() - 1)
+            } else if cur > 0 {
                 cur - 1
             } else if wrap_around {
                 self.context_tracks.len() - 1
@@ -267,6 +300,7 @@ impl TwoTierQueue {
                 0
             };
             let prev = self.context_tracks[prev_idx].clone();
+            self.playing_from_manual = false;
             self.current_context_index = Some(prev_idx);
             self.context_cursor = (prev_idx + 1).min(self.context_tracks.len());
             self.current_uri = Some(prev.uri.clone());
@@ -275,6 +309,7 @@ impl TwoTierQueue {
         }
         if !self.context_tracks.is_empty() {
             let prev = self.context_tracks[0].clone();
+            self.playing_from_manual = false;
             self.current_context_index = Some(0);
             self.context_cursor = 1.min(self.context_tracks.len());
             self.current_uri = Some(prev.uri.clone());
@@ -296,9 +331,11 @@ impl TwoTierQueue {
 
         if self.manual.first().is_some_and(|t| &*t.uri == track_uri) {
             let item = self.manual.remove(0);
+            self.playing_from_manual = true;
             self.current_track = Some(item);
             return;
         }
+        self.playing_from_manual = false;
         if let Some(pos) = self
             .context_tracks
             .iter()
@@ -328,6 +365,7 @@ impl TwoTierQueue {
         &mut self,
         context_name: String,
         context_uri: Option<Arc<str>>,
+        active_track: Option<TrackSummary>,
         manual: Vec<TrackSummary>,
         upcoming_context: Vec<TrackSummary>,
     ) {
@@ -338,6 +376,9 @@ impl TwoTierQueue {
         self.unshuffled_context = None;
         self.current_context_index = None;
         self.context_cursor = 0;
+        self.playing_from_manual = false;
+        self.current_uri = active_track.as_ref().map(|t| t.uri.clone());
+        self.current_track = active_track;
     }
 
     /// Looks up metadata for `uri` from active/queued items in memory.
@@ -488,5 +529,40 @@ mod tests {
         let orig_uris: Vec<&str> = original.iter().map(|t| &*t.uri).collect();
         assert_eq!(restored_uris, orig_uris);
         assert_eq!(q.current_context_index, Some(2));
+    }
+
+    #[test]
+    fn manual_track_prev_unshuffle_promote_and_clear_context() {
+        let mut q = TwoTierQueue::new();
+        q.set_context(
+            "Album",
+            Some(Arc::from("spotify:album:1")),
+            vec![track("1"), track("2"), track("3"), track("4")],
+            Some(1),
+        );
+        q.enqueue_next(track("m1"));
+
+        // Advance into manual track m1 while context was at index 1 ("2").
+        assert_eq!(&*q.step_next_track(false).unwrap().uri, "spotify:track:m1");
+        // Prev from manual track returns to context track "2" (index 1), not "1" (index 0).
+        assert_eq!(&*q.step_prev_track(false).unwrap().uri, "spotify:track:2");
+
+        // Shuffle, promote a context track to manual, then unshuffle while playing manual track:
+        // promoted track must not reappear in unshuffled context, and cursor stays anchored after track "2".
+        assert!(q.set_shuffle(true));
+        let promoted = q.promote_context_to_manual(0, 0).unwrap();
+        let promoted_uri = promoted.uri.to_string();
+        assert_eq!(q.step_next_track(false).unwrap().uri.as_ref(), promoted_uri);
+        assert!(q.set_shuffle(false));
+        assert!(
+            !q.context_upcoming()
+                .iter()
+                .any(|t| t.uri.as_ref() == promoted_uri)
+        );
+
+        // Clearing context with start_index=None clears current_uri and current_track.
+        q.set_context("", None, Vec::new(), None);
+        assert!(q.current_uri().is_none());
+        assert!(q.current_track().is_none());
     }
 }

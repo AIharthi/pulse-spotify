@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use iced::alignment::Vertical;
@@ -19,8 +19,8 @@ use pulse_assets::{
     icons,
 };
 use pulse_model::{
-    AppMode, AppViewState, AuthState, BackendEvent, CrateRef, ImageRef, LibraryScope, TrackSummary,
-    UiCommand,
+    AppMode, AppViewState, AuthState, BackendEvent, ConnectionStatus, CrateRef, ImageRef,
+    LibraryScope, TrackSummary, UiCommand,
 };
 use tokio::sync::mpsc;
 
@@ -28,8 +28,8 @@ use crate::cover_store::CoverTier;
 use crate::message::UiMsg;
 use crate::omnibox::omnibox_entries;
 use crate::ui_state::{
-    ActivePane, SingleThreadTokio, TrackContextMenu, UiState, id_filter_input, id_omnibox_input,
-    same_crate_target, scope_for_crate,
+    ActivePane, SingleThreadTokio, TrackContextMenu, UiState, id_crate_scroll, id_filter_input,
+    id_omnibox_input, id_queue_scroll, same_crate_target, scope_for_crate,
 };
 use crate::{
     crate_view, device_popover, focus_stage, keybindings, mini_player, omnibox, onboarding,
@@ -40,6 +40,7 @@ const GRID_CARD_ROW_HEIGHT: f32 = 176.0;
 const PAGINATION_LOOKAHEAD_ROWS: usize = 20;
 const MAX_THUMB_COVERS_PER_PASS: usize = 24;
 const MAX_IN_FLIGHT_COVERS: usize = 16;
+const COVER_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
 static NEXT_BACKEND_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -179,6 +180,7 @@ impl PulseApp {
 
     pub fn update(&mut self, msg: UiMsg) -> Task<UiMsg> {
         match msg {
+            UiMsg::Noop => Task::none(),
             UiMsg::Command(cmd) => self.handle_ui_command(cmd),
             UiMsg::Backend(ev) => self.handle_backend_event(ev),
             UiMsg::Tick1Hz => {
@@ -200,11 +202,20 @@ impl PulseApp {
                 Task::none()
             }
             UiMsg::WindowResized(size) => {
+                let was_narrow = self.ui.is_narrow_workbench();
                 self.ui.window_size = size;
                 if matches!(self.ui.view.mode, AppMode::Workbench | AppMode::FocusStage)
                     && size.height > 200.0
                 {
                     self.ui.workbench_size = size;
+                }
+                if was_narrow != self.ui.is_narrow_workbench() {
+                    self.ui.scrubbing_pos_ms = None;
+                    self.ui.dragging_queue_from = None;
+                    self.ui.hovered_track_row = None;
+                    self.ui.mini_player_hovered = false;
+                    self.ui.confirm_clear_queue_open = false;
+                    self.dragging_splitter = false;
                 }
                 Task::none()
             }
@@ -224,8 +235,15 @@ impl PulseApp {
                 evicted,
             } => {
                 self.in_flight_covers.remove(&(tier, Arc::clone(&key)));
+                self.ui.failed_covers.remove(&(tier, Arc::clone(&key)));
                 for (ev_id, ev_tier) in evicted {
                     self.ui.covers.remove(&ev_id, ev_tier);
+                }
+                if tier == CoverTier::Thumb && self.ui.view.mode == AppMode::MiniPlayer {
+                    let _ = self.cover_cache.clear_thumbs();
+                    self.ui.covers.clear_thumbs();
+                    self.publish_metrics();
+                    return Task::none();
                 }
                 if width > 0 && height > 0 && !pixels.is_empty() {
                     self.ui.covers.insert_decoded(
@@ -244,7 +262,14 @@ impl PulseApp {
                     }
                     self.publish_metrics();
                 }
-                Task::none()
+                self.schedule_visible_covers()
+            }
+            UiMsg::CoverFailed { key, tier } => {
+                self.in_flight_covers.remove(&(tier, Arc::clone(&key)));
+                self.ui
+                    .failed_covers
+                    .insert((tier, key), Instant::now());
+                self.schedule_visible_covers()
             }
             UiMsg::RadialTintReady {
                 width,
@@ -257,7 +282,9 @@ impl PulseApp {
 
             UiMsg::SwitchMode(mode) => self.switch_mode(mode),
             UiMsg::ToggleQueueInFocus => {
-                self.ui.show_focus_queue = !self.ui.show_focus_queue;
+                if self.ui.window_size.width >= 900.0 {
+                    self.ui.show_focus_queue = !self.ui.show_focus_queue;
+                }
                 self.schedule_visible_covers()
             }
             UiMsg::ToggleAlwaysOnTop => {
@@ -310,18 +337,39 @@ impl PulseApp {
                 self.ui.context_menu = None;
                 Task::none()
             }
-            UiMsg::HoverTrackRow(row) => {
-                self.ui.hovered_track_row = row;
+            UiMsg::HoverTrackRowEnter(idx) => {
+                self.ui.hovered_track_row = Some(idx);
                 Task::none()
             }
-            UiMsg::OpenTrackContextMenu { index, track, pos } => {
+            UiMsg::HoverTrackRowExit(idx) => {
+                if self.ui.hovered_track_row == Some(idx) {
+                    self.ui.hovered_track_row = None;
+                }
+                Task::none()
+            }
+            UiMsg::HoverMiniPlayer(hovered) => {
+                self.ui.mini_player_hovered = hovered;
+                Task::none()
+            }
+            UiMsg::OpenTrackContextMenu {
+                pane,
+                index,
+                track,
+                pos,
+            } => {
                 self.ui.device_popover_open = false;
                 let menu_pos = if pos == iced::Point::ORIGIN {
-                    iced::Point::new(560.0, (180.0 + (index % 12) as f32 * 40.0).min(620.0))
+                    let cursor = keybindings::last_cursor_pos();
+                    if cursor != iced::Point::ORIGIN {
+                        cursor
+                    } else {
+                        iced::Point::new(560.0, (180.0 + (index % 12) as f32 * 40.0).min(620.0))
+                    }
                 } else {
                     pos
                 };
                 self.ui.context_menu = Some(TrackContextMenu {
+                    pane,
                     index,
                     track,
                     pos: menu_pos,
@@ -380,6 +428,7 @@ impl PulseApp {
             UiMsg::FilterInputChanged(val) => {
                 self.ui.input_focused = true;
                 self.ui.view.crate_view.local_filter = val.clone();
+                self.ui.crate_scroll_y = 0.0;
                 self.ui.selected_crate_row = if val.trim().is_empty() {
                     if self.ui.view.crate_view.loaded_tracks.total() > 0 {
                         Some(0)
@@ -390,18 +439,37 @@ impl PulseApp {
                     keybindings::first_filtered_crate_index(&self.ui)
                 };
                 self.send_cmd(UiCommand::SetLocalFilter(val));
-                Task::none()
+                Task::batch([
+                    operation::scroll_to(
+                        id_crate_scroll(),
+                        operation::AbsoluteOffset {
+                            x: None,
+                            y: Some(0.0),
+                        },
+                    ),
+                    self.schedule_visible_covers(),
+                ])
             }
             UiMsg::ClearFilter => {
                 self.ui.view.crate_view.local_filter.clear();
                 self.ui.input_focused = false;
+                self.ui.crate_scroll_y = 0.0;
                 if self.ui.selected_crate_row.is_none()
                     && self.ui.view.crate_view.loaded_tracks.total() > 0
                 {
                     self.ui.selected_crate_row = Some(0);
                 }
                 self.send_cmd(UiCommand::SetLocalFilter(String::new()));
-                Task::none()
+                Task::batch([
+                    operation::scroll_to(
+                        id_crate_scroll(),
+                        operation::AbsoluteOffset {
+                            x: None,
+                            y: Some(0.0),
+                        },
+                    ),
+                    self.schedule_visible_covers(),
+                ])
             }
             UiMsg::OpenOmnibox => {
                 self.ui.device_popover_open = false;
@@ -521,6 +589,9 @@ impl PulseApp {
                 iced::clipboard::write(content)
             }
             UiMsg::DismissNotice => {
+                if let ConnectionStatus::Error(err) = &self.ui.view.connection {
+                    self.ui.dismissed_conn_error = Some(err.clone());
+                }
                 self.ui.view.notice_banner = None;
                 self.ui.status_toast = None;
                 Task::none()
@@ -533,6 +604,9 @@ impl PulseApp {
                 Task::none()
             }
             UiMsg::KeyEvent(ev, status) => {
+                if matches!(ev, iced::Event::Mouse(mouse::Event::ButtonReleased(_))) {
+                    self.dragging_splitter = false;
+                }
                 let mut queued_cmds = Vec::new();
                 let mut followups = vec![keybindings::dispatch_global_event(
                     &mut self.ui,
@@ -584,6 +658,7 @@ impl PulseApp {
                 let evicted = self.cover_cache.purge_ram();
                 self.ui.covers.purge();
                 self.ui.last_radial_accent = None;
+                self.ui.failed_covers.clear();
                 for (id, tier) in evicted {
                     self.in_flight_covers.remove(&(from_asset_tier(tier), id));
                 }
@@ -602,6 +677,7 @@ impl PulseApp {
             }
             UiCommand::SetLocalFilter(filter) => {
                 self.ui.view.crate_view.local_filter = filter.clone();
+                self.ui.crate_scroll_y = 0.0;
                 if filter.trim().is_empty()
                     && self.ui.selected_crate_row.is_none()
                     && self.ui.view.crate_view.loaded_tracks.total() > 0
@@ -609,7 +685,16 @@ impl PulseApp {
                     self.ui.selected_crate_row = Some(0);
                 }
                 self.send_cmd(UiCommand::SetLocalFilter(filter));
-                return Task::none();
+                return Task::batch([
+                    operation::scroll_to(
+                        id_crate_scroll(),
+                        operation::AbsoluteOffset {
+                            x: None,
+                            y: Some(0.0),
+                        },
+                    ),
+                    self.schedule_visible_covers(),
+                ]);
             }
             UiCommand::SetSearchFilter(filter) => {
                 self.ui.view.crate_view.search_filter = filter;
@@ -617,6 +702,7 @@ impl PulseApp {
             }
             UiCommand::SetSortOrder(sort) => {
                 self.ui.view.crate_view.sort_order = sort;
+                let mut reset_scroll = false;
                 if matches!(
                     self.ui.view.crate_view.active_crate,
                     CrateRef::LikedSongs
@@ -625,13 +711,25 @@ impl PulseApp {
                         | CrateRef::Recent
                         | CrateRef::AlbumsIndex
                 ) {
-                    if !matches!(self.ui.view.crate_view.active_crate, CrateRef::AlbumsIndex) {
+                    if matches!(self.ui.view.crate_view.active_crate, CrateRef::AlbumsIndex) {
+                        self.ui.view.crate_view.albums.clear();
+                    } else {
                         self.ui.view.crate_view.loaded_tracks.clear();
                     }
                     self.ui.crate_scroll_y = 0.0;
                     self.ui.view.crate_view.is_loading = true;
+                    reset_scroll = true;
                 }
                 self.send_cmd(UiCommand::SetSortOrder(sort));
+                if reset_scroll {
+                    return operation::scroll_to(
+                        id_crate_scroll(),
+                        operation::AbsoluteOffset {
+                            x: None,
+                            y: Some(0.0),
+                        },
+                    );
+                }
                 return Task::none();
             }
             UiCommand::SetScope(scope) => {
@@ -640,37 +738,101 @@ impl PulseApp {
                         let target = CrateRef::Search {
                             query: results.query.clone(),
                         };
-                        self.activate_crate_view(target, true, false);
-                        return self.schedule_visible_covers();
+                        let scroll_task = self.activate_crate_view(target, true, false);
+                        return Task::batch([scroll_task, self.schedule_visible_covers()]);
                     }
                     self.ui.view.crate_view.is_loading = true;
                     self.send_cmd(UiCommand::SetScope(LibraryScope::Search));
                     return Task::none();
                 }
                 let target = crate_for_scope(scope);
-                self.activate_crate_view(target, true, true);
+                let scroll_task = self.activate_crate_view(target, true, true);
                 self.send_cmd(UiCommand::SetScope(scope));
-                return self.schedule_visible_covers();
+                return Task::batch([scroll_task, self.schedule_visible_covers()]);
             }
             UiCommand::OpenCrate(target) => {
-                self.activate_crate_view(target.clone(), true, true);
+                let scroll_task = self.activate_crate_view(target.clone(), true, true);
                 self.send_cmd(UiCommand::OpenCrate(target));
-                return self.schedule_visible_covers();
+                return Task::batch([scroll_task, self.schedule_visible_covers()]);
             }
             UiCommand::RunGlobalSearch(query) => {
                 let target = CrateRef::Search {
                     query: query.clone(),
                 };
                 self.ui.view.crate_view.search_results = None;
-                self.activate_crate_view(target, true, true);
+                let scroll_task = self.activate_crate_view(target, true, true);
                 self.send_cmd(UiCommand::RunGlobalSearch(query));
-                return Task::none();
+                return scroll_task;
             }
             UiCommand::NavigateBack => {
                 return self.navigate_history(false);
             }
             UiCommand::NavigateForward => {
                 return self.navigate_history(true);
+            }
+            UiCommand::SetZeroconf {
+                enabled,
+                device_name,
+            } => {
+                self.ui.view.config.zeroconf_enabled = enabled;
+                let trimmed = device_name.trim();
+                if !trimmed.is_empty() {
+                    self.ui.view.config.device_name = trimmed.to_string();
+                    self.ui.settings_device_name_draft = trimmed.to_string();
+                }
+                self.send_cmd(UiCommand::SetZeroconf {
+                    enabled,
+                    device_name,
+                });
+            }
+            UiCommand::SaveClientId(val) => {
+                let normalized = val
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned);
+                self.ui.view.config.custom_client_id = normalized.clone();
+                self.ui.settings_client_id_draft = normalized.unwrap_or_default();
+                self.send_cmd(UiCommand::SaveClientId(val));
+            }
+            UiCommand::SetStreamQuality(q) => {
+                self.ui.view.config.stream_quality = q;
+                self.send_cmd(UiCommand::SetStreamQuality(q));
+            }
+            UiCommand::SetNormalisation(v) => {
+                self.ui.view.config.normalisation = v;
+                self.send_cmd(UiCommand::SetNormalisation(v));
+            }
+            UiCommand::SetGapless(v) => {
+                self.ui.view.config.gapless = v;
+                self.send_cmd(UiCommand::SetGapless(v));
+            }
+            UiCommand::SetAudioDevice(dev) => {
+                self.ui.view.config.audio_device = dev.clone();
+                self.send_cmd(UiCommand::SetAudioDevice(dev));
+            }
+            UiCommand::SetMprisEnabled(v) => {
+                self.ui.view.config.mpris_enabled = v;
+                self.send_cmd(UiCommand::SetMprisEnabled(v));
+            }
+            UiCommand::SetConfirmClearQueue(v) => {
+                self.ui.view.config.confirm_clear_queue = v;
+                self.send_cmd(UiCommand::SetConfirmClearQueue(v));
+            }
+            UiCommand::SetDiskCacheLimitMb(mb) => {
+                self.ui.view.config.disk_audio_cache_mb = mb;
+                self.send_cmd(UiCommand::SetDiskCacheLimitMb(mb));
+            }
+            UiCommand::SetVolume(vol) => {
+                self.ui.view.player_state.volume = vol;
+                if vol > 0 {
+                    self.ui.view.player_state.muted = false;
+                }
+                self.send_cmd(UiCommand::SetVolume(vol));
+            }
+            UiCommand::ToggleMute => {
+                self.ui.view.player_state.muted = !self.ui.view.player_state.muted;
+                self.send_cmd(UiCommand::ToggleMute);
             }
             other => {
                 self.send_cmd(other);
@@ -692,20 +854,25 @@ impl PulseApp {
                 .as_ref()
                 .is_some_and(|r| r.query == *query);
             if cached_hit {
-                self.activate_crate_view(target, false, false);
-                return self.schedule_visible_covers();
+                let scroll_task = self.activate_crate_view(target, false, false);
+                return Task::batch([scroll_task, self.schedule_visible_covers()]);
             }
             let q = query.clone();
-            self.activate_crate_view(target, false, true);
+            let scroll_task = self.activate_crate_view(target, false, true);
             self.send_cmd(UiCommand::RunGlobalSearch(q));
-            return Task::none();
+            return scroll_task;
         }
-        self.activate_crate_view(target.clone(), false, true);
+        let scroll_task = self.activate_crate_view(target.clone(), false, true);
         self.send_cmd(UiCommand::OpenCrate(target));
-        self.schedule_visible_covers()
+        Task::batch([scroll_task, self.schedule_visible_covers()])
     }
 
-    fn activate_crate_view(&mut self, target: CrateRef, push_history: bool, is_loading: bool) {
+    fn activate_crate_view(
+        &mut self,
+        target: CrateRef,
+        push_history: bool,
+        is_loading: bool,
+    ) -> Task<UiMsg> {
         if push_history {
             self.ui.push_history(target.clone());
         }
@@ -729,11 +896,21 @@ impl PulseApp {
             self.ui.crate_scroll_y = 0.0;
             self.ui.selected_crate_row = None;
             self.ui.hovered_track_row = None;
+            operation::scroll_to(
+                id_crate_scroll(),
+                operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(0.0),
+                },
+            )
+        } else {
+            Task::none()
         }
     }
 
     fn handle_backend_event(&mut self, ev: BackendEvent) -> Task<UiMsg> {
         let was_authenticated = matches!(self.ui.view.auth_state, AuthState::Authenticated { .. });
+        let prev_queue_scroll = self.ui.queue_scroll_y;
         let should_schedule_pages = matches!(
             ev,
             BackendEvent::CrateHeaderLoaded { .. }
@@ -768,6 +945,10 @@ impl PulseApp {
         {
             self.ui.view.crate_view.is_loading = true;
         }
+        if was_authenticated && !is_authenticated {
+            self.in_flight_covers.clear();
+            self.dragging_splitter = false;
+        }
 
         if should_sync_tint {
             self.sync_radial_tint();
@@ -775,10 +956,24 @@ impl PulseApp {
         if should_schedule_pages {
             self.maybe_request_crate_pages();
         }
+
+        let mut tasks = Vec::with_capacity(2);
+        if (self.ui.queue_scroll_y - prev_queue_scroll).abs() > f32::EPSILON {
+            tasks.push(operation::scroll_to(
+                id_queue_scroll(),
+                operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(self.ui.queue_scroll_y),
+                },
+            ));
+        }
         if should_refresh_covers {
-            self.schedule_visible_covers()
-        } else {
+            tasks.push(self.schedule_visible_covers());
+        }
+        if tasks.is_empty() {
             Task::none()
+        } else {
+            Task::batch(tasks)
         }
     }
 
@@ -800,6 +995,11 @@ impl PulseApp {
         self.ui.device_popover_open = false;
         self.ui.omnibox_open = false;
         self.ui.show_narrow_queue = false;
+        self.ui.confirm_clear_queue_open = false;
+        self.ui.scrubbing_pos_ms = None;
+        self.ui.dragging_queue_from = None;
+        self.ui.hovered_track_row = None;
+        self.ui.mini_player_hovered = false;
         self.dragging_splitter = false;
 
         if mode == AppMode::MiniPlayer {
@@ -853,7 +1053,7 @@ impl PulseApp {
         let Some(id) = self.ui.window_id else {
             return Task::none();
         };
-        let level = if self.ui.always_on_top {
+        let level = if self.ui.view.mode == AppMode::MiniPlayer && self.ui.always_on_top {
             window::Level::AlwaysOnTop
         } else {
             window::Level::Normal
@@ -988,6 +1188,14 @@ impl PulseApp {
             return None;
         }
 
+        let lookup_key = (tier, Arc::clone(&image.id));
+        if let Some(failed_at) = self.ui.failed_covers.get(&lookup_key) {
+            if failed_at.elapsed() < COVER_FAILURE_COOLDOWN {
+                return None;
+            }
+            self.ui.failed_covers.remove(&lookup_key);
+        }
+
         let asset_tier = to_asset_tier(tier);
         if let Some(decoded) = self.cover_cache.get_cached(asset_tier, &image.id) {
             self.ui.covers.insert_decoded(
@@ -1006,8 +1214,7 @@ impl PulseApp {
             return None;
         }
 
-        let inflight_key = (tier, Arc::clone(&image.id));
-        if !self.in_flight_covers.insert(inflight_key) {
+        if !self.in_flight_covers.insert(lookup_key) {
             return None;
         }
 
@@ -1030,14 +1237,9 @@ impl PulseApp {
                         .map(|(id, t)| (id, from_asset_tier(t)))
                         .collect(),
                 },
-                Err(_) => UiMsg::CoverReady {
+                Err(_) => UiMsg::CoverFailed {
                     key: fallback_id,
                     tier,
-                    width: 0,
-                    height: 0,
-                    pixels: Bytes::new(),
-                    accent_rgba: [229, 154, 62, 255],
-                    evicted: Vec::new(),
                 },
             },
         ))
@@ -1105,7 +1307,8 @@ pub fn view(app: &PulseApp) -> Element<'_, UiMsg> {
                                 .width(Length::Fill)
                                 .height(Length::Fixed(320.0))
                                 .style(theme::popover_panel),
-                        ),
+                        )
+                        .on_press(UiMsg::Noop),
                         Space::new().height(Length::Fixed(64.0)),
                     ]
                     .width(Length::Fill)
@@ -1238,7 +1441,8 @@ fn view_confirm_clear_queue_modal<'a>(state: &'a UiState) -> Element<'a, UiMsg> 
         .width(Length::Fixed(380.0))
         .padding(theme::SPACE_LG)
         .style(theme::popover_panel),
-    );
+    )
+    .on_press(UiMsg::Noop);
 
     let backdrop = mouse_area(
         container(Space::new().width(Length::Fill).height(Length::Fill))
@@ -1311,7 +1515,7 @@ fn view_context_menu<'a>(
         .y
         .clamp(8.0, (state.window_size.height - menu_h - 8.0).max(8.0));
 
-    let play_cmd = if state.active_pane == ActivePane::Queue {
+    let play_cmd = if menu.pane == ActivePane::Queue {
         UiCommand::PlayQueueIndex(menu.index)
     } else {
         UiCommand::PlayTrackInContext {
@@ -1408,7 +1612,8 @@ fn view_context_menu<'a>(
             .width(Length::Fixed(menu_w))
             .padding(6)
             .style(theme::popover_panel),
-    );
+    )
+    .on_press(UiMsg::Noop);
 
     let positioned = container(
         column![
@@ -1690,12 +1895,18 @@ fn collect_visible_thumb_refs(state: &UiState) -> Vec<ImageRef> {
                 for al in detail.albums.iter().take(12) {
                     push_unique(al.cover.as_ref());
                 }
+                for single in detail.singles.iter().take(12) {
+                    push_unique(single.cover.as_ref());
+                }
             }
         }
         CrateRef::Search { .. } => {
             if let Some(res) = &cv.search_results {
                 for track in res.tracks.iter().take(14) {
                     push_unique(track.cover.as_ref());
+                }
+                for ar in res.artists.iter().take(6) {
+                    push_unique(ar.cover.as_ref());
                 }
                 for al in res.albums.iter().take(6) {
                     push_unique(al.cover.as_ref());
@@ -1711,9 +1922,18 @@ fn collect_visible_thumb_refs(state: &UiState) -> Vec<ImageRef> {
         | CrateRef::Recent => {
             let first = ((scroll_y / theme::TRACK_ROW_HEIGHT).floor() as usize).saturating_sub(2);
             let vis = (vp_h / theme::TRACK_ROW_HEIGHT).ceil() as usize + 6;
-            for idx in first..(first + vis).min(cv.loaded_tracks.total()) {
-                if let Some(track) = cv.loaded_tracks.get(idx) {
-                    push_unique(track.cover.as_ref());
+            if let Some(matched) = keybindings::filtered_crate_indices(state) {
+                let end = (first + vis).min(matched.len());
+                for &idx in &matched[first.min(end)..end] {
+                    if let Some(track) = cv.loaded_tracks.get(idx) {
+                        push_unique(track.cover.as_ref());
+                    }
+                }
+            } else {
+                for idx in first..(first + vis).min(cv.loaded_tracks.total()) {
+                    if let Some(track) = cv.loaded_tracks.get(idx) {
+                        push_unique(track.cover.as_ref());
+                    }
                 }
             }
         }
@@ -2036,5 +2256,42 @@ mod tests {
             added_at_unix: None,
         };
         assert_eq!(context_uri_for_track(&CrateRef::Recent, &dummy), "recent");
+    }
+
+    #[test]
+    fn optimistic_settings_cover_failure_cooldown_and_hover_race() {
+        let (mut app, mut cmd_rx) = test_app();
+
+        // Settings commands update UI config state optimistically.
+        let _ = app.update(UiMsg::Command(UiCommand::SetGapless(false)));
+        assert!(!app.ui.view.config.gapless);
+        assert_eq!(cmd_rx.try_recv().ok(), Some(UiCommand::SetGapless(false)));
+
+        let _ = app.update(UiMsg::Command(UiCommand::SetZeroconf {
+            enabled: false,
+            device_name: String::from("Living Room"),
+        }));
+        assert!(!app.ui.view.config.zeroconf_enabled);
+        assert_eq!(app.ui.view.config.device_name, "Living Room");
+
+        // Out-of-order HoverTrackRowExit(0) after HoverTrackRowEnter(1) does not clear row 1.
+        let _ = app.update(UiMsg::HoverTrackRowEnter(0));
+        let _ = app.update(UiMsg::HoverTrackRowEnter(1));
+        let _ = app.update(UiMsg::HoverTrackRowExit(0));
+        assert_eq!(app.ui.hovered_track_row, Some(1));
+        let _ = app.update(UiMsg::HoverTrackRowExit(1));
+        assert_eq!(app.ui.hovered_track_row, None);
+
+        // CoverFailed records cooldown so ensure_cover backs off instead of busy-looping.
+        let img = ImageRef {
+            id: Arc::from("missing-cover"),
+            url: None,
+        };
+        assert!(app.ensure_cover(CoverTier::Thumb, img.clone()).is_some());
+        let _ = app.update(UiMsg::CoverFailed {
+            key: Arc::from("missing-cover"),
+            tier: CoverTier::Thumb,
+        });
+        assert!(app.ensure_cover(CoverTier::Thumb, img).is_none());
     }
 }

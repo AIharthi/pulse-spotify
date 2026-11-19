@@ -7,7 +7,7 @@ use pulse_model::{AppMode, CrateRef, UiCommand};
 
 use crate::message::UiMsg;
 use crate::theme;
-use crate::ui_state::{UiState, id_omnibox_input};
+use crate::ui_state::{UiState, id_omnibox_input, id_omnibox_scroll};
 use crate::widgets;
 
 /// Resolved omnibox match entry rendered inside the palette and triggered on Enter/click.
@@ -285,6 +285,7 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
                 search_bar,
                 container(
                     scrollable(list_col)
+                        .id(id_omnibox_scroll())
                         .height(Length::Shrink)
                         .style(theme::dark_scrollable),
                 )
@@ -294,10 +295,12 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             ]
             .spacing(theme::SPACE_SM),
         )
-        .width(Length::Fixed(560.0))
+        .width(Length::Fill)
+        .max_width(560.0)
         .padding(14)
         .style(theme::modal_sheet),
-    );
+    )
+    .on_press(UiMsg::Noop);
 
     let overlay = container(
         column![

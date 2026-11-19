@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -37,7 +37,6 @@ use spotatui_librespot_playback::player::Player;
 use spotatui_librespot_protocol::connect::ClusterUpdate;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
-static PULSE_ENV_INIT: Once = Once::new();
 static AUDIO_KEY_REJECTED: AtomicBool = AtomicBool::new(false);
 static STAGED_TRACKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static SOUNDCLOUD_CLIENT_ID: OnceLock<AsyncMutex<Option<String>>> = OnceLock::new();
@@ -73,11 +72,18 @@ impl LocalPlayback {
         self.sink_flush.store(true, Ordering::Release);
     }
 
-    /// Cleanly shuts down `Spirc`, stops the local `Player`, and aborts the background task.
-    pub fn shutdown(self) {
+    /// Cleanly shuts down `Spirc` (giving it a brief window to flush Connect disconnect),
+    /// stops the local `Player`, and aborts the background task if it has not exited.
+    pub async fn shutdown(self) {
         let _ = self.spirc.shutdown();
         self.player.stop();
-        self.spirc_task.abort();
+        let mut handle = self.spirc_task;
+        if tokio::time::timeout(Duration::from_millis(400), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -221,20 +227,6 @@ pub fn audio_pipeline_changed(old: &AppConfig, new: &AppConfig) -> bool {
         || old.gapless != new.gapless
 }
 
-fn configure_pulse_env_once() {
-    PULSE_ENV_INIT.call_once(|| {
-        // SAFETY: Called once during backend startup before creating `PulseAudioSink` / `Player`.
-        unsafe {
-            if std::env::var_os("PULSE_PROP_application.name").is_none() {
-                std::env::set_var("PULSE_PROP_application.name", "Pulse");
-            }
-            if std::env::var_os("PULSE_PROP_stream.description").is_none() {
-                std::env::set_var("PULSE_PROP_stream.description", "Pulse Spotify Player");
-            }
-        }
-    });
-}
-
 /// Ensures ALSA's default PCM routes via PipeWire when system-wide `/etc/alsa/conf.d` is absent.
 pub fn ensure_pipewire_alsa_user_config() {
     #[cfg(unix)]
@@ -285,26 +277,40 @@ enum ResolvedSink {
     Alsa(audio_backend::SinkBuilder, Option<String>),
 }
 
+fn is_explicit_alsa_device(name: &str) -> bool {
+    matches!(name, "alsa" | "default" | "sysdefault")
+        || name.starts_with("hw:")
+        || name.starts_with("plughw:")
+        || name.starts_with("sysdefault:")
+        || name.starts_with("dmix:")
+        || name.starts_with("front:")
+        || name.starts_with("iec958:")
+        || name.starts_with("hdmi:")
+}
+
 fn resolve_sink_and_device(requested_device: Option<&str>) -> Result<ResolvedSink, String> {
-    let wants_pulse_or_default = matches!(
-        requested_device,
-        None | Some("pulseaudio") | Some("pipewire") | Some("pulse")
-    );
-    if wants_pulse_or_pulse_available(wants_pulse_or_default) {
-        return Ok(ResolvedSink::Pulse(None));
+    let trimmed = requested_device.map(str::trim).filter(|s| !s.is_empty());
+    let pulse_available = pulse_socket_available();
+
+    if pulse_available {
+        match trimmed {
+            None | Some("pulseaudio") | Some("pipewire") | Some("pulse") => {
+                return Ok(ResolvedSink::Pulse(None));
+            }
+            Some(name) if !is_explicit_alsa_device(name) => {
+                return Ok(ResolvedSink::Pulse(Some(name.to_string())));
+            }
+            _ => {}
+        }
     }
 
     let alsa_builder = audio_backend::find(Some("alsa".to_string()))
         .ok_or_else(|| "librespot audio backends (pulseaudio/alsa) are unavailable".to_string())?;
-    let alsa_device = match requested_device {
-        Some("pulseaudio") => None,
-        other => other.map(ToOwned::to_owned),
+    let alsa_device = match trimmed {
+        None | Some("pulseaudio") | Some("pipewire") | Some("pulse") | Some("alsa") => None,
+        Some(other) => Some(other.to_string()),
     };
     Ok(ResolvedSink::Alsa(alsa_builder, alsa_device))
-}
-
-fn wants_pulse_or_pulse_available(wants_pulse: bool) -> bool {
-    wants_pulse && pulse_socket_available()
 }
 
 /// Creates a lazy PipeWire/PulseAudio or ALSA [`Player`], `SoftMixer`, and [`Spirc`] task.
@@ -318,7 +324,6 @@ pub async fn start_local_playback(
     initial_volume: u16,
 ) -> Result<LocalPlayback, String> {
     AUDIO_KEY_REJECTED.store(false, Ordering::Relaxed);
-    configure_pulse_env_once();
     ensure_pipewire_alsa_user_config();
 
     let resolved_sink = resolve_sink_and_device(config.audio_device.as_deref())?;
@@ -448,7 +453,14 @@ pub fn mark_track_staged_in_memory(track_uri: &str) {
     }
 }
 
-/// Clears the in-memory set of staged track URIs (used on cache clear or sign-out).
+/// Removes a single track URI from the in-memory staged set (e.g. before retrying an Unavailable track).
+pub fn unmark_track_staged_in_memory(track_uri: &str) {
+    if let Ok(mut g) = staged_tracks().lock() {
+        g.remove(track_uri);
+    }
+}
+
+/// Clears the in-memory set of staged track URIs (used on cache clear, LRU prune, or sign-out).
 pub fn clear_staged_tracks_in_memory() {
     if let Ok(mut g) = staged_tracks().lock() {
         g.clear();
@@ -542,17 +554,29 @@ fn build_preview_with_spotify_header(audio_bytes: &[u8]) -> Vec<u8> {
 }
 
 fn contains_term(haystack_lower: &str, term: &str) -> bool {
-    let bytes = haystack_lower.as_bytes();
+    if term.is_empty() {
+        return false;
+    }
     let mut start = 0usize;
     while let Some(pos) = haystack_lower[start..].find(term) {
         let abs = start + pos;
         let end = abs + term.len();
-        let left_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
-        let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        let left_ok = haystack_lower[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let right_ok = haystack_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
         if left_ok && right_ok {
             return true;
         }
-        start = abs + 1;
+        let step = haystack_lower[abs..]
+            .chars()
+            .next()
+            .map_or(1, char::len_utf8);
+        start = abs + step;
     }
     false
 }
@@ -592,9 +616,9 @@ fn has_unwanted_variant(candidate_title: &str, spotify_title: &str) -> bool {
 }
 
 fn normalize_alnum(s: &str) -> String {
-    s.to_ascii_lowercase()
+    s.to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -634,13 +658,13 @@ fn artist_matches(haystack: &str, artist: &str) -> bool {
     let hay = normalize_alnum(haystack);
     let art = normalize_alnum(artist);
     if hay.is_empty() || art.is_empty() {
-        return true;
+        return false;
     }
     if hay.contains(&art) {
         return true;
     }
     art.split_whitespace()
-        .filter(|w| w.len() >= 3)
+        .filter(|w| w.chars().count() >= 3)
         .any(|w| contains_term(&hay, w))
 }
 
@@ -648,6 +672,20 @@ async fn http_get_bytes(http: &HttpClient, url: &str) -> Option<Bytes> {
     let req = Request::builder()
         .method(Method::GET)
         .uri(url)
+        .body(Bytes::new())
+        .ok()?;
+    if let Ok(Ok(body)) = tokio::time::timeout(Duration::from_secs(12), http.request_body(req)).await
+    {
+        return Some(body);
+    }
+    // `HttpClient::request_body` rejects 3xx redirects; resolve redirect chain once and retry.
+    let resolved = resolve_redirect_url(http, url).await;
+    if resolved == url {
+        return None;
+    }
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&resolved)
         .body(Bytes::new())
         .ok()?;
     tokio::time::timeout(Duration::from_secs(12), http.request_body(req))
@@ -735,15 +773,18 @@ async fn refresh_soundcloud_client_id(http: &HttpClient) -> Option<String> {
     let html = String::from_utf8_lossy(&html_bytes);
     let mut script_urls = Vec::new();
     let mut idx = 0usize;
-    while let Some(pos) = html[idx..].find("https://a-v2.sndcdn.com/assets/") {
+    const PREFIX: &str = "https://a-v2.sndcdn.com/assets/";
+    while let Some(pos) = html[idx..].find(PREFIX) {
         let start = idx + pos;
-        if let Some(end_rel) = html[start..].find(".js") {
-            let end = start + end_rel + 3;
-            script_urls.push(html[start..end].to_string());
-            idx = end;
-        } else {
-            break;
+        let tail = &html[start..];
+        let token_len = tail
+            .find(|c: char| matches!(c, '"' | '\'' | '>' | '<') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let candidate = &tail[..token_len];
+        if candidate.ends_with(".js") {
+            script_urls.push(candidate.to_string());
         }
+        idx = start + token_len.max(PREFIX.len());
     }
     for url in script_urls.into_iter().rev().take(5) {
         if let Some(js_bytes) = http_get_bytes(http, &url).await {
@@ -777,6 +818,11 @@ async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
     if input.is_empty() || input.len() > MAX_DOWNLOAD_BYTES {
         return None;
     }
+    let child_pid = Arc::new(AtomicU32::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let pid_for_task = Arc::clone(&child_pid);
+    let done_for_task = Arc::clone(&finished);
+
     let res = tokio::time::timeout(
         Duration::from_secs(12),
         tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
@@ -802,23 +848,35 @@ async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
                 .spawn()
                 .ok()?;
 
-            let mut stdin = child.stdin.take()?;
-            let mut stdout = child.stdout.take()?;
+            pid_for_task.store(child.id(), Ordering::Release);
 
+            let mut stdin = child.stdin.take()?;
+            let stdout = child.stdout.take()?;
+
+            let mut exceeded_cap = false;
             let out = std::thread::scope(|s| {
                 let writer = s.spawn(move || {
                     let _ = stdin.write_all(&input);
                     drop(stdin);
                 });
                 let mut ogg = Vec::new();
-                let mut limited = (&mut stdout).take(MAX_FFMPEG_OUTPUT_BYTES);
+                let mut limited = stdout.take(MAX_FFMPEG_OUTPUT_BYTES + 1);
                 let read_res = limited.read_to_end(&mut ogg);
+                // Drop `stdout` immediately so if `ffmpeg` exceeded MAX_FFMPEG_OUTPUT_BYTES
+                // it receives SIGPIPE/kill instead of deadlocking `writer.join()` and `child.wait()`.
+                drop(limited);
+                if ogg.len() as u64 > MAX_FFMPEG_OUTPUT_BYTES {
+                    exceeded_cap = true;
+                    let _ = child.kill();
+                }
                 let _ = writer.join();
                 read_res.ok().map(|_| ogg)
             });
 
-            let status = child.wait().ok()?;
-            if !status.success() {
+            let status = child.wait().ok();
+            done_for_task.store(true, Ordering::Release);
+            let status = status?;
+            if exceeded_cap || !status.success() {
                 return None;
             }
             let ogg = out?;
@@ -833,6 +891,19 @@ async fn ffmpeg_transcode_to_ogg(input: Vec<u8>) -> Option<Vec<u8>> {
 
     match res {
         Ok(Ok(Some(ogg))) => Some(ogg),
+        Err(_) => {
+            // Timed out: terminate the child process so pipes close and the blocking thread exits.
+            if !finished.load(Ordering::Acquire) {
+                let pid = child_pid.load(Ordering::Acquire);
+                if pid != 0 {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -886,7 +957,7 @@ fn score_soundcloud_item(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let combined_haystack = format!("{cand_title} {uploader} {meta_artist}");
-    if !artist_matches(&combined_haystack, primary_artist) {
+    if !primary_artist.trim().is_empty() && !artist_matches(&combined_haystack, primary_artist) {
         return None;
     }
 
@@ -962,6 +1033,18 @@ fn score_soundcloud_item(
 }
 
 async fn download_hls_segments(http: &HttpClient, m3u8_url: &str) -> Option<Vec<u8>> {
+    let base_url = url::Url::parse(m3u8_url).ok();
+    let resolve = |raw: &str| -> Option<String> {
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            Some(raw.to_string())
+        } else {
+            base_url
+                .as_ref()
+                .and_then(|b| b.join(raw).ok())
+                .map(|u| u.to_string())
+        }
+    };
+
     let m3u8_bytes = http_get_bytes(http, m3u8_url).await?;
     let m3u8_text = String::from_utf8_lossy(&m3u8_bytes);
     let mut urls: Vec<String> = Vec::new();
@@ -973,15 +1056,21 @@ async fn download_hls_segments(http: &HttpClient, m3u8_url: &str) -> Option<Vec<
         if line.starts_with("#EXT-X-KEY") && !line.contains("METHOD=NONE") {
             return None;
         }
-        if let Some(idx) = line.find("URI=\"") {
+        if line.starts_with("#EXT-X-MAP:")
+            && let Some(idx) = line.find("URI=\"")
+        {
             let tail = &line[idx + 5..];
-            if let Some(end) = tail.find('"') {
-                urls.push(tail[..end].to_string());
+            if let Some(end) = tail.find('"')
+                && let Some(u) = resolve(&tail[..end])
+            {
+                urls.push(u);
             }
             continue;
         }
-        if !line.starts_with('#') {
-            urls.push(line.to_string());
+        if !line.starts_with('#')
+            && let Some(u) = resolve(line)
+        {
+            urls.push(u);
         }
     }
     if urls.is_empty() || urls.len() > 120 {
@@ -1126,7 +1215,7 @@ fn score_audius_item(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let combined = format!("{cand_title} {user_name} {user_handle}");
-    if !artist_matches(&combined, primary_artist) {
+    if !primary_artist.trim().is_empty() && !artist_matches(&combined, primary_artist) {
         return None;
     }
 
@@ -1264,7 +1353,7 @@ fn score_youtube_candidate(
         .unwrap_or_default();
 
     let combined = format!("{cand_title} {owner}");
-    if !artist_matches(&combined, primary_artist) {
+    if !primary_artist.trim().is_empty() && !artist_matches(&combined, primary_artist) {
         return None;
     }
 
@@ -1518,9 +1607,9 @@ pub async fn ensure_track_playable_in_cache(session: &Session, track_uri_str: &s
         return;
     };
 
-    if cache
-        .file(first_fid)
-        .is_some_and(|mut f| is_cached_file_unencrypted(&mut f))
+    if head_fids
+        .iter()
+        .all(|&fid| cache.file(fid).is_some_and(|mut f| is_cached_file_unencrypted(&mut f)))
     {
         mark_track_staged_in_memory(track_uri_str);
         guard.complete();
@@ -1529,16 +1618,25 @@ pub async fn ensure_track_playable_in_cache(session: &Session, track_uri_str: &s
 
     if !AUDIO_KEY_REJECTED.load(Ordering::Relaxed) {
         let key_res = tokio::time::timeout(
-            Duration::from_millis(1500),
+            Duration::from_millis(3000),
             session.audio_key().request(key_track_id, first_fid),
         )
         .await;
-        if let Ok(Ok(_key)) = key_res {
-            mark_track_staged_in_memory(track_uri_str);
-            guard.complete();
-            return;
+        match key_res {
+            Ok(Ok(_key)) => {
+                mark_track_staged_in_memory(track_uri_str);
+                guard.complete();
+                return;
+            }
+            Ok(Err(_)) => {
+                // Explicit AP audio key rejection: switch to fallback audio staging.
+                AUDIO_KEY_REJECTED.store(true, Ordering::Relaxed);
+            }
+            Err(_) => {
+                // Transient timeout: do not permanently poison AUDIO_KEY_REJECTED for the session.
+                return;
+            }
         }
-        AUDIO_KEY_REJECTED.store(true, Ordering::Relaxed);
     }
 
     let spotify_title = track.name.trim().to_string();
@@ -1626,12 +1724,17 @@ pub async fn ensure_track_playable_in_cache(session: &Session, track_uri_str: &s
         return;
     };
 
-    for fid in head_fids {
-        let _ = cache.remove_file(fid);
-        let _ = cache.save_file(fid, &mut Cursor::new(&bytes_to_save));
+    let mut saved_any = false;
+    for fid in &head_fids {
+        let _ = cache.remove_file(*fid);
+        if cache.save_file(*fid, &mut Cursor::new(&bytes_to_save)).is_ok() {
+            saved_any = true;
+        }
     }
-    mark_track_staged_in_memory(track_uri_str);
-    guard.complete();
+    if saved_any && head_fids.iter().any(|&fid| cache.file(fid).is_some()) {
+        mark_track_staged_in_memory(track_uri_str);
+        guard.complete();
+    }
 }
 
 /// Builds a `Spirc` `LoadRequest` from a context URI with current shuffle/repeat flags.
@@ -1785,5 +1888,15 @@ mod tests {
         assert_eq!(parse_duration_ms("03:31"), Some(211_000));
         assert_eq!(parse_duration_ms("1:02:03"), Some(3_723_000));
         assert_eq!(parse_duration_ms("bad"), None);
+    }
+
+    #[test]
+    fn multibyte_utf8_contains_term_and_unicode_alnum_and_empty_artist() {
+        assert!(contains_term("björk — jóga (live)", "live"));
+        assert!(!contains_term("björk — jóga", "live"));
+        assert_eq!(normalize_alnum("崎山 蒼志!"), "崎山 蒼志");
+        assert!(!artist_matches("", "M83"));
+        assert!(!artist_matches("M83", ""));
+        assert!(artist_matches("M83", "M83 Official"));
     }
 }

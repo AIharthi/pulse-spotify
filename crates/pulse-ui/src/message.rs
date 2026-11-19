@@ -8,10 +8,13 @@ use iced::{Event, Point, Size, event, window};
 use pulse_model::{AppMode, BackendEvent, SettingsTab, TrackSummary, UiCommand};
 
 use crate::cover_store::CoverTier;
+use crate::ui_state::ActivePane;
 
 /// Unified message type dispatched across views, keybindings, backend events, and asset tasks.
 #[derive(Debug, Clone)]
 pub enum UiMsg {
+    /// No-op message used to capture pointer clicks on modal/popover bodies without dismissing them.
+    Noop,
     /// Pass-through command dispatched to `pulse-backend` / `pulse-assets`.
     Command(UiCommand),
     /// State snapshot or delta pushed asynchronously by `pulse-backend`.
@@ -39,6 +42,11 @@ pub enum UiMsg {
         accent_rgba: [u8; 4],
         evicted: Vec<(Arc<str>, CoverTier)>,
     },
+    /// Cover fetch/decode failed so UI can apply temporary negative-cache backoff.
+    CoverFailed {
+        key: Arc<str>,
+        tier: CoverTier,
+    },
     /// Regenerated `128x128` radial-alpha cover tint bitmap.
     RadialTintReady {
         width: u32,
@@ -59,8 +67,11 @@ pub enum UiMsg {
     QueueScrolled(scrollable::Viewport),
     SelectCrateRow(usize),
     SelectQueueRow(usize),
-    HoverTrackRow(Option<usize>),
+    HoverTrackRowEnter(usize),
+    HoverTrackRowExit(usize),
+    HoverMiniPlayer(bool),
     OpenTrackContextMenu {
+        pane: ActivePane,
         index: usize,
         track: TrackSummary,
         pos: Point,

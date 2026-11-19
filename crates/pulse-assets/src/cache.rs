@@ -211,15 +211,27 @@ impl DiskCacheState {
             total_bytes: 0,
             files: HashMap::new(),
         };
-        state.scan_existing();
-        state.prune_to_cap();
+        if !state.dir.as_os_str().is_empty() && state.cap_bytes > 0 {
+            state.scan_existing();
+            state.prune_to_cap();
+        }
         state
+    }
+
+    fn remove_file_entry(&mut self, path: &Path) {
+        if let Some(meta) = self.files.remove(path) {
+            self.total_bytes = self.total_bytes.saturating_sub(meta.size);
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     fn scan_existing(&mut self) {
         self.files.clear();
         self.total_bytes = 0;
 
+        if self.dir.as_os_str().is_empty() {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -450,10 +462,9 @@ impl CoverCache {
             });
         }
 
-        // Check compressed disk cache; compressed bytes stay scoped and drop after decode.
-        if let Some(compressed) = self.read_disk_compressed(&image.id, tier) {
-            let decoded = decode_and_mask_cover(&compressed, tier)?;
-            drop(compressed);
+        // Check compressed disk cache; corrupt files are removed so we can try remaining
+        // candidates or fall back to `fetcher`.
+        if let Some(decoded) = self.decode_from_disk_cache(&image.id, tier) {
             let evicted = self.insert_ram(tier, Arc::clone(&image.id), decoded.clone());
             return Ok(CoverFetchResult {
                 id: image.id,
@@ -503,10 +514,10 @@ impl CoverCache {
         evicted
     }
 
-    fn read_disk_compressed(&self, id: &str, tier: CoverTier) -> Option<Bytes> {
+    fn decode_from_disk_cache(&self, id: &str, tier: CoverTier) -> Option<DecodedCover> {
         let candidates = {
             let disk = self.disk.lock().unwrap();
-            if disk.cap_bytes == 0 {
+            if disk.cap_bytes == 0 || disk.dir.as_os_str().is_empty() {
                 return None;
             }
             match tier {
@@ -520,10 +531,22 @@ impl CoverCache {
         };
 
         for path in candidates {
-            if let Ok(bytes) = std::fs::read(&path) {
-                let mut disk = self.disk.lock().unwrap();
-                disk.touch(&path);
-                return Some(Bytes::from(bytes));
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            match decode_and_mask_cover(&bytes, tier) {
+                Ok(decoded) => {
+                    let mut disk = self.disk.lock().unwrap();
+                    disk.touch(&path);
+                    return Some(decoded);
+                }
+                Err(_) => {
+                    let mut disk = self.disk.lock().unwrap();
+                    disk.remove_file_entry(&path);
+                    self.stats
+                        .disk_bytes
+                        .store(disk.total_bytes, Ordering::Relaxed);
+                }
             }
         }
         None
@@ -535,7 +558,7 @@ impl CoverCache {
             (disk.dir.clone(), disk.cap_bytes)
         };
 
-        if cap_bytes == 0 || compressed.len() as u64 > cap_bytes {
+        if dir.as_os_str().is_empty() || cap_bytes == 0 || compressed.len() as u64 > cap_bytes {
             return;
         }
         if std::fs::create_dir_all(&dir).is_err() {
@@ -864,6 +887,32 @@ mod tests {
         assert_eq!(res_a.cover.width, 128);
         assert_eq!(res_b.cover.width, 128);
         assert!(res_b.evicted.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_disk_entry_is_evicted_and_falls_back_to_fetcher() {
+        let dir = temp_cache_dir("corrupt_evict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let corrupt_path = disk_path(&dir, "bad-cover", CoverTier::Thumb);
+        std::fs::write(&corrupt_path, b"not-a-valid-image").unwrap();
+
+        let cache = CoverCache::with_dir(dir.clone(), 1024 * 1024);
+        assert!(cache.stats().disk_bytes > 0);
+
+        let png = sample_png([40, 180, 120, 255], 128);
+        let fetched = block_on(cache.get_or_fetch(
+            CoverTier::Thumb,
+            image_ref("bad-cover"),
+            move |_| async move { Ok(png) },
+        ))
+        .unwrap();
+
+        assert_eq!(fetched.cover.width, 128);
+        // Corrupt file must have been replaced with valid compressed bytes.
+        let disk_bytes = std::fs::read(&corrupt_path).unwrap();
+        assert_ne!(disk_bytes, b"not-a-valid-image");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

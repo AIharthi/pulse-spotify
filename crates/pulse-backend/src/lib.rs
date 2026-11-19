@@ -14,7 +14,7 @@ use std::fs;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use pulse_model::{
@@ -65,7 +65,7 @@ use crate::player::{
     ClusterStream, LocalPlayback, audio_pipeline_changed, build_context_load_request,
     build_tracks_load_request, clear_staged_tracks_in_memory, ensure_track_playable_in_cache,
     is_track_staged_in_memory, purge_stale_encrypted_audio_cache, start_local_playback,
-    stream_audio_metrics,
+    stream_audio_metrics, unmark_track_staged_in_memory,
 };
 use crate::queue::TwoTierQueue;
 use crate::telemetry::{CoverStatsHook, collect_telemetry};
@@ -219,31 +219,58 @@ impl Drop for BackendHandle {
 }
 
 enum InternalMsg {
-    LibrespotOAuthFinished(Result<WebApiToken, String>),
-    WebApiOAuthFinished(Result<WebApiToken, String>),
+    LibrespotOAuthFinished {
+        attempt_id: u64,
+        result: Result<WebApiToken, String>,
+    },
+    WebApiOAuthFinished {
+        attempt_id: u64,
+        result: Result<WebApiToken, String>,
+    },
     DiscoveryCredentials(Credentials),
     DiscoveryError(String),
     SessionConnected {
+        session_gen: u64,
         outcome: ConnectOutcome,
         zeroconf_only: bool,
     },
-    SessionConnectFailed(String),
+    SessionConnectFailed {
+        session_gen: u64,
+        error: String,
+    },
+    ReconnectTimerFired {
+        session_gen: u64,
+    },
     ClusterReceived(spotatui_librespot_protocol::connect::Cluster),
     PlayerEvent(PlayerEvent),
-    DisplayNameLoaded(String),
-    CurrentTrackDetailLoaded {
-        uri: String,
-        detail: TrackDetail,
+    DisplayNameLoaded {
+        session_gen: u64,
+        name: String,
     },
-    BackendEventsBatch(Result<Vec<BackendEvent>, String>),
+    CurrentTrackDetailLoaded {
+        session_gen: u64,
+        uri: String,
+        detail: Option<TrackDetail>,
+    },
+    BackendEventsBatch {
+        session_gen: u64,
+        result: Result<Vec<BackendEvent>, String>,
+    },
     LikeMutationFinished(Result<(String, bool), String>),
     FollowMutationFinished(Result<(), String>),
     PlayCrateResolved {
+        session_gen: u64,
+        play_seq: u64,
         shuffle: bool,
         result: Result<(String, Option<String>, Vec<pulse_model::TrackSummary>), String>,
     },
-    QueueCrateResolved(Result<(String, Option<String>, Vec<pulse_model::TrackSummary>), String>),
+    QueueCrateResolved {
+        session_gen: u64,
+        result: Result<(String, Option<String>, Vec<pulse_model::TrackSummary>), String>,
+    },
     PlayTrackResolved {
+        session_gen: u64,
+        play_seq: u64,
         context_uri: String,
         track_uri: String,
         hint_index: Option<usize>,
@@ -253,13 +280,14 @@ enum InternalMsg {
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
         result: Result<Vec<u8>, String>,
     },
-    WebApiTokenRefreshed(WebApiToken),
     ExecuteStagedLocalLoad {
+        session_gen: u64,
         seq: u64,
         request: LoadRequest,
         sync_queue: bool,
     },
     UnavailableRetryReady {
+        session_gen: u64,
         uri: String,
     },
 }
@@ -286,7 +314,7 @@ struct BackendState {
     config: AppConfig,
     device_id: String,
     auth_meta: AuthMeta,
-    web_api_token: Option<WebApiToken>,
+    web_api_token: Rc<tokio::sync::Mutex<Option<WebApiToken>>>,
     recent_history: RecentHistory,
     auth_state: AuthState,
     conn_status: ConnectionStatus,
@@ -296,8 +324,13 @@ struct BackendState {
     sort_order: SortOrder,
     pre_mute_volume: u16,
     local_is_active: bool,
+    local_queue_owned: bool,
     current_creds: Option<Credentials>,
+    retry_creds: Option<(Credentials, bool)>,
     session: Option<Session>,
+    session_gen: u64,
+    oauth_attempt_id: u64,
+    web_oauth_attempt_id: u64,
     local_playback: Option<LocalPlayback>,
     library: Rc<tokio::sync::Mutex<LibraryService>>,
     http: Arc<HttpClient>,
@@ -322,9 +355,11 @@ struct BackendState {
     current_playing_uri: Option<String>,
     loading_track_uri: Option<String>,
     pending_local_load_uri: Option<String>,
+    pending_local_load_paused: bool,
     active_play_request_id: Option<u64>,
-    expecting_remote_transfer: bool,
+    expecting_remote_transfer_until: Option<Instant>,
     retried_unavailable_uri: Option<String>,
+    consecutive_unavailable_skips: usize,
 }
 
 impl BackendState {
@@ -337,11 +372,20 @@ impl BackendState {
         }
     }
 
+    fn is_expecting_remote_transfer(&self) -> bool {
+        self.expecting_remote_transfer_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
     fn sync_audio_metrics(&mut self) {
         let (badge, rate, kbps) = stream_audio_metrics(&self.config);
         self.player_state.audio_badge = badge;
         self.player_state.sample_rate_hz = rate;
         self.player_state.bitrate_kbps = kbps;
+    }
+
+    fn emit_config(&self, emitter: &Emitter) {
+        emitter.emit(BackendEvent::ConfigUpdated(self.config.clone()));
     }
 
     fn emit_player(&self, emitter: &Emitter) {
@@ -371,6 +415,7 @@ impl BackendState {
         if let Err(err) = save_config(&self.paths, &self.config) {
             emitter.error(format!("Failed to save config: {err}"));
         }
+        self.emit_config(emitter);
     }
 
     async fn rebuild_local_player_if_active(
@@ -390,6 +435,10 @@ impl BackendState {
         };
         let old_vol = self.player_state.volume;
         teardown_session(self).await;
+        self.local_player_stopped = true;
+        self.player_state.is_playing = false;
+        self.emit_player(emitter);
+        self.sync_mpris(false).await;
 
         let session_cfg = SessionConfig {
             device_id: self.device_id.clone(),
@@ -405,6 +454,8 @@ impl BackendState {
                         .unwrap_or(creds),
                 );
                 self.session = Some(new_session);
+                self.conn_status = ConnectionStatus::Connected;
+                emitter.emit(BackendEvent::ConnectionChanged(self.conn_status.clone()));
                 let events = lp.player.get_player_event_channel();
                 let cluster_stream = lp.cluster_stream.take();
                 self.local_playback = Some(lp);
@@ -413,7 +464,11 @@ impl BackendState {
                     spawn_cluster_listener(self, stream, int_tx);
                 }
             }
-            Err(err) => emitter.error(err),
+            Err(err) => {
+                self.conn_status = ConnectionStatus::Error(err.clone());
+                emitter.emit(BackendEvent::ConnectionChanged(self.conn_status.clone()));
+                emitter.error(err);
+            }
         }
     }
 }
@@ -465,7 +520,7 @@ async fn actor_main(
         config: config.clone(),
         device_id: device_id.clone(),
         auth_meta,
-        web_api_token,
+        web_api_token: Rc::new(tokio::sync::Mutex::new(web_api_token)),
         recent_history,
         auth_state: if config.zeroconf_enabled {
             AuthState::ConnectOnly {
@@ -490,8 +545,13 @@ async fn actor_main(
         sort_order: SortOrder::default(),
         pre_mute_volume: initial_vol.max(32_768),
         local_is_active: false,
+        local_queue_owned: false,
         current_creds: None,
+        retry_creds: None,
         session: None,
+        session_gen: 0,
+        oauth_attempt_id: 0,
+        web_oauth_attempt_id: 0,
         local_playback: None,
         library: Rc::new(tokio::sync::Mutex::new(LibraryService::new())),
         http: Arc::new(HttpClient::new(None)),
@@ -516,12 +576,15 @@ async fn actor_main(
         current_playing_uri: None,
         loading_track_uri: None,
         pending_local_load_uri: None,
+        pending_local_load_paused: false,
         active_play_request_id: None,
-        expecting_remote_transfer: false,
+        expecting_remote_transfer_until: None,
         retried_unavailable_uri: None,
+        consecutive_unavailable_skips: 0,
     };
     state.sync_audio_metrics();
 
+    state.emit_config(&emitter);
     emitter.emit(BackendEvent::AuthChanged(state.auth_state.clone()));
     emitter.emit(BackendEvent::ConnectionChanged(state.conn_status.clone()));
     state.emit_player(&emitter);
@@ -554,6 +617,12 @@ async fn actor_main(
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
+                if let Some(c) = state.oauth_cancel.take() {
+                    c.cancel();
+                }
+                if let Some(c) = state.web_oauth_cancel.take() {
+                    c.cancel();
+                }
                 teardown_session(&mut state).await;
                 stop_discovery(&mut state);
                 if let Some(m) = state.mpris.take() {
@@ -646,19 +715,22 @@ async fn teardown_session(state: &mut BackendState) {
         h.abort();
     }
     if let Some(lp) = state.local_playback.take() {
-        lp.shutdown();
+        lp.shutdown().await;
     }
     if let Some(sess) = state.session.take() {
         sess.shutdown();
     }
     state.local_is_active = false;
+    state.local_queue_owned = false;
     state.local_player_stopped = false;
     state.local_spirc_queue_dirty = false;
     state.loading_track_uri = None;
     state.pending_local_load_uri = None;
+    state.pending_local_load_paused = false;
     state.active_play_request_id = None;
-    state.expecting_remote_transfer = false;
+    state.expecting_remote_transfer_until = None;
     state.retried_unavailable_uri = None;
+    state.consecutive_unavailable_skips = 0;
 }
 
 fn spawn_session_connect(
@@ -668,6 +740,9 @@ fn spawn_session_connect(
     int_tx: &mpsc::UnboundedSender<InternalMsg>,
     emitter: &Emitter,
 ) {
+    state.session_gen = state.session_gen.wrapping_add(1);
+    let session_gen = state.session_gen;
+    state.retry_creds = Some((creds.clone(), zeroconf_only));
     state.conn_status = ConnectionStatus::Connecting;
     emitter.emit(BackendEvent::ConnectionChanged(state.conn_status.clone()));
 
@@ -693,12 +768,13 @@ fn spawn_session_connect(
         {
             Ok(outcome) => {
                 let _ = tx.send(InternalMsg::SessionConnected {
+                    session_gen,
                     outcome,
                     zeroconf_only,
                 });
             }
-            Err(err) => {
-                let _ = tx.send(InternalMsg::SessionConnectFailed(err));
+            Err(error) => {
+                let _ = tx.send(InternalMsg::SessionConnectFailed { session_gen, error });
             }
         }
     });
@@ -726,6 +802,8 @@ fn start_librespot_oauth(
     if let Some(prev) = state.oauth_cancel.take() {
         prev.cancel();
     }
+    state.oauth_attempt_id = state.oauth_attempt_id.wrapping_add(1);
+    let attempt_id = state.oauth_attempt_id;
     let pkce = PkceChallenge::generate();
     let auth_url = match build_authorize_url(
         KEYMASTER_CLIENT_ID,
@@ -752,7 +830,7 @@ fn start_librespot_oauth(
     let http = Arc::clone(&state.http);
     let tx = int_tx.clone();
     tokio::task::spawn_local(async move {
-        let res = async {
+        let result = async {
             let code = wait_for_oauth_callback(
                 "127.0.0.1:5588".to_string(),
                 "/login".to_string(),
@@ -770,7 +848,7 @@ fn start_librespot_oauth(
             .await
         }
         .await;
-        let _ = tx.send(InternalMsg::LibrespotOAuthFinished(res));
+        let _ = tx.send(InternalMsg::LibrespotOAuthFinished { attempt_id, result });
     });
 }
 
@@ -783,6 +861,8 @@ fn start_web_api_oauth(
     if let Some(prev) = state.web_oauth_cancel.take() {
         prev.cancel();
     }
+    state.web_oauth_attempt_id = state.web_oauth_attempt_id.wrapping_add(1);
+    let attempt_id = state.web_oauth_attempt_id;
     let pkce = PkceChallenge::generate();
     let auth_url = match build_authorize_url(
         &custom_cid,
@@ -806,7 +886,7 @@ fn start_web_api_oauth(
     let http = Arc::clone(&state.http);
     let tx = int_tx.clone();
     tokio::task::spawn_local(async move {
-        let res = async {
+        let result = async {
             let code = wait_for_oauth_callback(
                 "127.0.0.1:8898".to_string(),
                 "/callback".to_string(),
@@ -824,7 +904,7 @@ fn start_web_api_oauth(
             .await
         }
         .await;
-        let _ = tx.send(InternalMsg::WebApiOAuthFinished(res));
+        let _ = tx.send(InternalMsg::WebApiOAuthFinished { attempt_id, result });
     });
 }
 
@@ -864,6 +944,8 @@ async fn handle_ui_command(
             if let Some(c) = state.web_oauth_cancel.take() {
                 c.cancel();
             }
+            state.oauth_attempt_id = state.oauth_attempt_id.wrapping_add(1);
+            state.web_oauth_attempt_id = state.web_oauth_attempt_id.wrapping_add(1);
             state.pending_web_api_oauth = None;
             if !matches!(state.auth_state, AuthState::Authenticated { .. }) {
                 state.auth_state = if state.config.zeroconf_enabled {
@@ -909,9 +991,19 @@ async fn handle_ui_command(
             state.emit_devices(emitter);
         }
         UiCommand::SignOut => {
+            state.session_gen = state.session_gen.wrapping_add(1);
+            state.oauth_attempt_id = state.oauth_attempt_id.wrapping_add(1);
+            state.web_oauth_attempt_id = state.web_oauth_attempt_id.wrapping_add(1);
+            if let Some(c) = state.oauth_cancel.take() {
+                c.cancel();
+            }
+            if let Some(c) = state.web_oauth_cancel.take() {
+                c.cancel();
+            }
             teardown_session(state).await;
             state.current_creds = None;
-            state.web_api_token = None;
+            state.retry_creds = None;
+            *state.web_api_token.lock().await = None;
             state.pending_web_api_oauth = None;
             state.current_crate = CrateRef::LikedSongs;
             state.last_crate_tracks = None;
@@ -924,9 +1016,11 @@ async fn handle_ui_command(
             state.current_playing_uri = None;
             state.loading_track_uri = None;
             state.pending_local_load_uri = None;
+            state.pending_local_load_paused = false;
             state.active_play_request_id = None;
-            state.expecting_remote_transfer = false;
+            state.expecting_remote_transfer_until = None;
             state.retried_unavailable_uri = None;
+            state.consecutive_unavailable_skips = 0;
             clear_staged_tracks_in_memory();
             state.remote_queue_meta = None;
             state.auth_meta = AuthMeta::default();
@@ -980,6 +1074,8 @@ async fn handle_ui_command(
             )));
         }
         UiCommand::Play => {
+            state.pending_local_load_paused = false;
+            state.consecutive_unavailable_skips = 0;
             if let Some(remote_id) = state.is_remote_active()
                 && let Some(sess) = state.session.clone()
             {
@@ -1053,6 +1149,9 @@ async fn handle_ui_command(
                 )
                 .await;
             } else if let Some(ref lp) = state.local_playback {
+                if state.pending_local_load_uri.is_some() {
+                    state.pending_local_load_paused = true;
+                }
                 lp.request_sink_flush();
                 let _ = lp.spirc.pause();
                 state.player_state.is_playing = false;
@@ -1082,6 +1181,9 @@ async fn handle_ui_command(
                     .await;
                 }
             } else if state.player_state.is_playing {
+                if state.pending_local_load_uri.is_some() {
+                    state.pending_local_load_paused = true;
+                }
                 if let Some(ref lp) = state.local_playback {
                     lp.request_sink_flush();
                     let _ = lp.spirc.pause();
@@ -1089,6 +1191,8 @@ async fn handle_ui_command(
                     state.emit_player(emitter);
                 }
             } else if state.local_player_stopped {
+                state.pending_local_load_paused = false;
+                state.consecutive_unavailable_skips = 0;
                 let uris = state.queue.remaining_uris_from_current();
                 if !uris.is_empty() {
                     let play_uri = state
@@ -1124,6 +1228,7 @@ async fn handle_ui_command(
                     .await;
                 }
             } else if let Some(ref lp) = state.local_playback {
+                state.pending_local_load_paused = false;
                 let _ = lp.spirc.activate();
                 let _ = lp.spirc.play();
                 state.player_state.is_playing = true;
@@ -1131,6 +1236,7 @@ async fn handle_ui_command(
             }
         }
         UiCommand::NextTrack => {
+            state.consecutive_unavailable_skips = 0;
             if let Some(remote_id) = state.is_remote_active()
                 && let Some(sess) = state.session.clone()
             {
@@ -1144,38 +1250,45 @@ async fn handle_ui_command(
                 if let Some(ref lp) = state.local_playback {
                     lp.request_sink_flush();
                 }
-                let wrap = state.player_state.repeat == RepeatMode::Context;
-                if let Some(next) = state.queue.step_next_track(wrap) {
-                    state.emit_queue(emitter);
-                    set_optimistic_playing_track(state, &next, int_tx, emitter);
-                    let uris = state.queue.remaining_uris_from_current();
-                    let loaded_now = load_tracks_on_active_device(
-                        state,
-                        uris,
-                        Some(next.uri.to_string()),
-                        false,
-                        int_tx,
-                        emitter,
-                    )
-                    .await;
-                    if loaded_now && !state.queue.manual_items().is_empty() {
-                        sync_manual_queue_to_active_device(state).await;
-                    }
-                } else if state.queue.current_uri().is_some() {
+                if !state.local_queue_owned {
                     if let Some(ref lp) = state.local_playback {
-                        let _ = lp.spirc.pause();
+                        let _ = lp.spirc.next();
                     }
-                    state.local_player_stopped = true;
-                    state.player_state.is_playing = false;
-                    state.player_state.position_ms = 0;
-                    state.emit_player(emitter);
-                    state.sync_mpris(false).await;
-                } else if let Some(ref lp) = state.local_playback {
-                    let _ = lp.spirc.next();
+                } else {
+                    let wrap = state.player_state.repeat == RepeatMode::Context;
+                    if let Some(next) = state.queue.step_next_track(wrap) {
+                        state.emit_queue(emitter);
+                        set_optimistic_playing_track(state, &next, int_tx, emitter);
+                        let uris = state.queue.remaining_uris_from_current();
+                        let loaded_now = load_tracks_on_active_device(
+                            state,
+                            uris,
+                            Some(next.uri.to_string()),
+                            false,
+                            int_tx,
+                            emitter,
+                        )
+                        .await;
+                        if loaded_now && !state.queue.manual_items().is_empty() {
+                            sync_manual_queue_to_active_device(state).await;
+                        }
+                    } else if state.queue.current_uri().is_some() {
+                        if let Some(ref lp) = state.local_playback {
+                            let _ = lp.spirc.pause();
+                        }
+                        state.local_player_stopped = true;
+                        state.player_state.is_playing = false;
+                        state.player_state.position_ms = 0;
+                        state.emit_player(emitter);
+                        state.sync_mpris(false).await;
+                    } else if let Some(ref lp) = state.local_playback {
+                        let _ = lp.spirc.next();
+                    }
                 }
             }
         }
         UiCommand::PrevTrack => {
+            state.consecutive_unavailable_skips = 0;
             if let Some(remote_id) = state.is_remote_active()
                 && let Some(sess) = state.session.clone()
             {
@@ -1191,12 +1304,16 @@ async fn handle_ui_command(
                 }
                 if state.player_state.position_ms > 3_000 {
                     state.player_state.position_ms = 0;
-                    state.pending_seek_emit = true;
                     state.emit_player(emitter);
                     if state.loading_track_uri.is_none()
                         && let Some(ref lp) = state.local_playback
                     {
+                        state.pending_seek_emit = true;
                         let _ = lp.spirc.set_position_ms(0);
+                    }
+                } else if !state.local_queue_owned {
+                    if let Some(ref lp) = state.local_playback {
+                        let _ = lp.spirc.prev();
                     }
                 } else {
                     let wrap = state.player_state.repeat == RepeatMode::Context;
@@ -1228,16 +1345,20 @@ async fn handle_ui_command(
             } else {
                 pos_ms
             };
-            state.player_state.position_ms = clamped;
-            state.pending_seek_emit = true;
-            state.emit_player(emitter);
             if let Some(remote_id) = state.is_remote_active()
                 && let Some(sess) = state.session.clone()
             {
+                state.player_state.position_ms = clamped;
+                state.emit_player(emitter);
+                state.sync_mpris(true).await;
                 let _ = send_remote_command(&sess, &remote_id, cmd_seek_to(clamped)).await;
             } else if state.loading_track_uri.is_none()
+                && state.pending_local_load_uri.is_none()
                 && let Some(ref lp) = state.local_playback
             {
+                state.player_state.position_ms = clamped;
+                state.pending_seek_emit = true;
+                state.emit_player(emitter);
                 lp.request_sink_flush();
                 let _ = lp.spirc.set_position_ms(clamped);
             }
@@ -1326,6 +1447,10 @@ async fn handle_ui_command(
                 emitter.error("Sign in with Spotify Premium first.");
                 return;
             };
+            state.consecutive_unavailable_skips = 0;
+            state.play_load_seq = state.play_load_seq.wrapping_add(1);
+            let play_seq = state.play_load_seq;
+            let session_gen = state.session_gen;
             if let Some(cref) = crate_ref_from_context_uri(&context_uri)
                 && let Some((_, _, cached)) =
                     cached_tracks_for_crate(state, &cref, Some(&track_uri))
@@ -1375,6 +1500,8 @@ async fn handle_ui_command(
                     resolve_uris_via_track_api(&sess, &[track_clone]).await
                 };
                 let _ = tx.send(InternalMsg::PlayTrackResolved {
+                    session_gen,
+                    play_seq,
                     context_uri: ctx_clone,
                     track_uri,
                     hint_index: Some(index),
@@ -1383,6 +1510,7 @@ async fn handle_ui_command(
             });
         }
         UiCommand::PlayCrate { crate_ref, shuffle } => {
+            state.consecutive_unavailable_skips = 0;
             start_play_crate(state, crate_ref, shuffle, int_tx, emitter).await;
         }
         UiCommand::QueueCrate(crate_ref) => {
@@ -1390,6 +1518,7 @@ async fn handle_ui_command(
                 emitter.error("Sign in with Spotify Premium first.");
                 return;
             };
+            let session_gen = state.session_gen;
             let lib = Rc::clone(&state.library);
             let recent = state.recent_history.clone();
             let sort = state.sort_order;
@@ -1400,7 +1529,10 @@ async fn handle_ui_command(
                     .await
                     .resolve_crate_tracks(&sess, &crate_ref, &recent, sort)
                     .await;
-                let _ = tx.send(InternalMsg::QueueCrateResolved(result));
+                let _ = tx.send(InternalMsg::QueueCrateResolved {
+                    session_gen,
+                    result,
+                });
             });
         }
         UiCommand::EnqueueNext(track) => {
@@ -1429,11 +1561,18 @@ async fn handle_ui_command(
             context_index,
             manual_index,
         } => {
-            if state
+            if let Some(promoted) = state
                 .queue
                 .promote_context_to_manual(context_index, manual_index)
-                .is_some()
             {
+                if let Some(ref mut meta) = state.remote_queue_meta
+                    && let Some(pos) = meta
+                        .context_next_tracks
+                        .iter()
+                        .position(|v| v.get("uri").and_then(|u| u.as_str()) == Some(&*promoted.uri))
+                {
+                    meta.context_next_tracks.remove(pos);
+                }
                 state.local_spirc_queue_dirty = true;
                 state.emit_queue(emitter);
                 sync_manual_queue_to_active_device(state).await;
@@ -1451,6 +1590,7 @@ async fn handle_ui_command(
             sync_manual_queue_to_active_device(state).await;
         }
         UiCommand::PlayQueueIndex(index) => {
+            state.consecutive_unavailable_skips = 0;
             let _ = play_queue_index_cmd(state, index, int_tx, emitter).await;
         }
         UiCommand::OpenCrate(crate_ref) => {
@@ -1516,9 +1656,10 @@ async fn handle_ui_command(
             }
             let dev_id = state.device_id.clone();
             let cfg = state.config.clone();
+            let vol = state.player_state.volume;
             let tx = int_tx.clone();
             tokio::task::spawn_local(async move {
-                if let Ok(cluster) = refresh_cluster_passive(&sess, &dev_id, &cfg).await {
+                if let Ok(cluster) = refresh_cluster_passive(&sess, &dev_id, &cfg, vol).await {
                     let _ = tx.send(InternalMsg::ClusterReceived(cluster));
                 }
             });
@@ -1526,15 +1667,15 @@ async fn handle_ui_command(
         UiCommand::TransferPlayback { device_id } => {
             let Some(sess) = state.session.clone() else { return };
             if device_id == state.device_id {
-                state.expecting_remote_transfer = false;
+                state.expecting_remote_transfer_until = None;
                 if let Some(ref lp) = state.local_playback {
                     let _ = lp.spirc.transfer(None);
                 }
             } else {
-                state.expecting_remote_transfer = true;
+                state.expecting_remote_transfer_until = Some(Instant::now() + Duration::from_secs(8));
                 let from_id = state.device_id.clone();
                 if let Err(err) = transfer_playback(&sess, &from_id, &device_id).await {
-                    state.expecting_remote_transfer = false;
+                    state.expecting_remote_transfer_until = None;
                     emitter.error(err);
                 }
             }
@@ -1678,23 +1819,21 @@ fn spawn_crate_fetch(
     let Some(sess) = state.session.clone() else {
         return;
     };
+    let session_gen = state.session_gen;
     let lib = Rc::clone(&state.library);
+    let web_tok = Rc::clone(&state.web_api_token);
     let paths = state.paths.clone();
-    let mut token = state.web_api_token.clone();
-    let orig_tok = token
-        .as_ref()
-        .map(|t| (t.access_token.clone(), t.expires_at_epoch_secs));
     let recent = state.recent_history.clone();
     let sort = state.sort_order;
     let tx = int_tx.clone();
     tokio::task::spawn_local(async move {
-        let res = lib
-            .lock()
-            .await
+        let mut lib_guard = lib.lock().await;
+        let mut tok_guard = web_tok.lock().await;
+        let result = lib_guard
             .fetch_crate_page(
                 &sess,
                 &paths,
-                &mut token,
+                &mut tok_guard,
                 &recent,
                 &crate_ref,
                 offset,
@@ -1702,15 +1841,10 @@ fn spawn_crate_fetch(
                 sort,
             )
             .await;
-        if let Some(updated) = token {
-            let changed = orig_tok.as_ref().is_none_or(|(acc, exp)| {
-                acc != &updated.access_token || *exp != updated.expires_at_epoch_secs
-            });
-            if changed {
-                let _ = tx.send(InternalMsg::WebApiTokenRefreshed(updated));
-            }
-        }
-        let _ = tx.send(InternalMsg::BackendEventsBatch(res));
+        let _ = tx.send(InternalMsg::BackendEventsBatch {
+            session_gen,
+            result,
+        });
     });
 }
 
@@ -1721,9 +1855,12 @@ async fn handle_internal_msg(
     emitter: &Emitter,
 ) {
     match msg {
-        InternalMsg::LibrespotOAuthFinished(res) => {
+        InternalMsg::LibrespotOAuthFinished { attempt_id, result } => {
+            if attempt_id != state.oauth_attempt_id {
+                return;
+            }
             state.oauth_cancel = None;
-            match res {
+            match result {
                 Ok(tok) => {
                     let creds = Credentials::with_access_token(&tok.access_token);
                     spawn_session_connect(state, creds, false, int_tx, emitter);
@@ -1744,15 +1881,19 @@ async fn handle_internal_msg(
                 }
             }
         }
-        InternalMsg::WebApiOAuthFinished(res) => {
+        InternalMsg::WebApiOAuthFinished { attempt_id, result } => {
+            if attempt_id != state.web_oauth_attempt_id {
+                return;
+            }
             state.web_oauth_cancel = None;
-            match res {
+            match result {
                 Ok(token) => {
                     if let Err(err) = save_web_api_token(&state.paths, &token) {
                         emitter.error(format!("Failed to save Web API token: {err}"));
                     } else {
-                        state.web_api_token = Some(token);
+                        *state.web_api_token.lock().await = Some(token);
                     }
+                    let web_ready = state.web_api_token.lock().await.is_some();
                     if let AuthState::Authenticated {
                         username,
                         display_name,
@@ -1765,7 +1906,7 @@ async fn handle_internal_msg(
                             username: username.clone(),
                             display_name: display_name.clone(),
                             tier: *tier,
-                            web_api_ready: state.web_api_token.is_some(),
+                            web_api_ready: web_ready,
                             zeroconf_only: *zeroconf_only,
                         };
                         emitter.emit(BackendEvent::AuthChanged(state.auth_state.clone()));
@@ -1803,7 +1944,8 @@ async fn handle_internal_msg(
             }
         }
         InternalMsg::DiscoveryCredentials(creds) => {
-            if state.session.is_none() {
+            if state.session.is_none() && !matches!(state.conn_status, ConnectionStatus::Connecting)
+            {
                 spawn_session_connect(state, creds, true, int_tx, emitter);
             }
         }
@@ -1812,30 +1954,65 @@ async fn handle_internal_msg(
                 "Zeroconf discovery error: {err}"
             ))));
         }
-        InternalMsg::SessionConnectFailed(err) => {
+        InternalMsg::SessionConnectFailed { session_gen, error } => {
+            if session_gen != state.session_gen {
+                return;
+            }
             let cached_playable = state.refresh_offline_capability();
             state.conn_status = ConnectionStatus::Offline {
                 retry_in_secs: 15,
                 cached_playable,
             };
             emitter.emit(BackendEvent::ConnectionChanged(state.conn_status.clone()));
-            emitter.error(err);
+            emitter.error(error);
+
+            if state.retry_creds.is_some() {
+                let tx = int_tx.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    let _ = tx.send(InternalMsg::ReconnectTimerFired { session_gen });
+                });
+            }
+        }
+        InternalMsg::ReconnectTimerFired { session_gen } => {
+            if session_gen == state.session_gen
+                && state.session.is_none()
+                && matches!(state.conn_status, ConnectionStatus::Offline { .. })
+                && let Some((creds, zeroconf_only)) = state.retry_creds.clone()
+            {
+                spawn_session_connect(state, creds, zeroconf_only, int_tx, emitter);
+            }
         }
         InternalMsg::SessionConnected {
+            session_gen,
             outcome,
             zeroconf_only,
         } => {
+            if session_gen != state.session_gen {
+                if let ConnectOutcome::Premium {
+                    session,
+                    local_playback,
+                    ..
+                } = outcome
+                {
+                    local_playback.shutdown().await;
+                    session.shutdown();
+                }
+                return;
+            }
             teardown_session(state).await;
+            let web_ready = state.web_api_token.lock().await.is_some();
             match outcome {
                 ConnectOutcome::NonPremium {
                     username,
                     account_type,
                 } => {
+                    state.retry_creds = None;
                     state.auth_state = AuthState::Authenticated {
                         username: username.clone(),
                         display_name: username,
                         tier: AccountTier::Free,
-                        web_api_ready: state.web_api_token.is_some(),
+                        web_api_ready: web_ready,
                         zeroconf_only,
                     };
                     state.conn_status = ConnectionStatus::Error(
@@ -1855,7 +2032,8 @@ async fn handle_internal_msg(
                 } => {
                     state.auth_meta.zeroconf_only = zeroconf_only;
                     let _ = save_auth_meta(&state.paths, &state.auth_meta);
-                    state.current_creds = Some(reusable_creds);
+                    state.current_creds = Some(reusable_creds.clone());
+                    state.retry_creds = Some((reusable_creds, zeroconf_only));
                     state.session = Some(session.clone());
                     state.conn_status = ConnectionStatus::Connected;
                     let display_name = state
@@ -1867,7 +2045,7 @@ async fn handle_internal_msg(
                         username: username.clone(),
                         display_name,
                         tier: AccountTier::Premium,
-                        web_api_ready: state.web_api_token.is_some(),
+                        web_api_ready: web_ready,
                         zeroconf_only,
                     };
                     emitter.emit(BackendEvent::Notice(None));
@@ -1905,7 +2083,10 @@ async fn handle_internal_msg(
                     tokio::task::spawn_local(async move {
                         let name = lib.lock().await.fetch_display_name(&session, &username).await;
                         if let Some(dn) = name {
-                            let _ = tx.send(InternalMsg::DisplayNameLoaded(dn));
+                            let _ = tx.send(InternalMsg::DisplayNameLoaded {
+                                session_gen,
+                                name: dn,
+                            });
                         }
                     });
 
@@ -1920,8 +2101,11 @@ async fn handle_internal_msg(
                 }
             }
         }
-        InternalMsg::DisplayNameLoaded(dn) => {
-            state.auth_meta.display_name = Some(dn.clone());
+        InternalMsg::DisplayNameLoaded { session_gen, name } => {
+            if session_gen != state.session_gen {
+                return;
+            }
+            state.auth_meta.display_name = Some(name.clone());
             let _ = save_auth_meta(&state.paths, &state.auth_meta);
             if let AuthState::Authenticated {
                 username,
@@ -1933,7 +2117,7 @@ async fn handle_internal_msg(
             {
                 state.auth_state = AuthState::Authenticated {
                     username: username.clone(),
-                    display_name: dn,
+                    display_name: name,
                     tier: *tier,
                     web_api_ready: *web_api_ready,
                     zeroconf_only: *zeroconf_only,
@@ -1954,23 +2138,35 @@ async fn handle_internal_msg(
                 .active_device_id
                 .as_deref()
                 .filter(|id| *id != state.device_id.as_str());
+            let was_local = state.local_is_active;
 
             if cluster_local_active {
                 state.local_is_active = true;
-                state.expecting_remote_transfer = false;
+                // Keep `expecting_remote_transfer_until` intact if a transfer was just requested
+                // so an intermediate stale cluster listing the local device does not cancel it.
             } else if !state.local_is_active {
                 state.local_is_active = false;
-            } else if state.expecting_remote_transfer
+                state.expecting_remote_transfer_until = None;
+            } else if state.is_expecting_remote_transfer()
                 || (remote_active_id.is_some()
                     && state.pending_local_load_uri.is_none()
-                    && state.loading_track_uri.is_none()
-                    && !state.player_state.is_playing)
+                    && state.loading_track_uri.is_none())
             {
                 state.local_is_active = false;
-                state.expecting_remote_transfer = false;
+                state.local_queue_owned = false;
+                state.expecting_remote_transfer_until = None;
+                state.pending_local_load_uri = None;
+                state.pending_local_load_paused = false;
+                state.loading_track_uri = None;
+                state.active_play_request_id = None;
+                state.current_playing_uri = None;
+                if was_local && let Some(ref lp) = state.local_playback {
+                    lp.request_sink_flush();
+                    let _ = lp.spirc.pause();
+                }
             } else {
-                // Local playback is active/loading: do not let a stale/empty Cluster snapshot
-                // clobber `local_is_active` or overwrite the local queue.
+                // Local playback is actively loading or cluster has no remote active device:
+                // do not let a stale/empty Cluster snapshot clobber local playback or queue.
                 devices.active_device_id = Some(state.device_id.clone());
                 for dev in &mut devices.available_devices {
                     dev.is_active = dev.is_local;
@@ -1997,12 +2193,12 @@ async fn handle_internal_msg(
                     state.player_state.volume = v;
                     state.player_state.muted = v == 0;
                 }
-                if let Some(t) = snap.active_track {
-                    state.player_state.active_track = Some(t);
-                }
+                let active_summary = snap.active_track.as_ref().map(|t| t.summary.clone());
+                state.player_state.active_track = snap.active_track;
                 state.queue.apply_remote_snapshot(
                     snap.context_name,
                     snap.context_uri,
+                    active_summary,
                     snap.manual_queue,
                     snap.context_queue,
                 );
@@ -2014,16 +2210,26 @@ async fn handle_internal_msg(
         InternalMsg::PlayerEvent(ev) => {
             handle_player_event(state, ev, int_tx, emitter).await;
         }
-        InternalMsg::CurrentTrackDetailLoaded { uri, detail } => {
+        InternalMsg::CurrentTrackDetailLoaded {
+            session_gen,
+            uri,
+            detail,
+        } => {
             if state.in_flight_detail_uri.as_deref() == Some(uri.as_str()) {
                 state.in_flight_detail_uri = None;
+            }
+            let Some(detail) = detail else {
+                return;
+            };
+            if session_gen != state.session_gen || state.session.is_none() {
+                return;
             }
             let matches_current = state.current_playing_uri.as_deref() == Some(uri.as_str());
             let matches_active = state
                 .player_state
                 .active_track
                 .as_ref()
-                .is_none_or(|t| t.summary.uri.as_ref() == uri);
+                .is_some_and(|t| t.summary.uri.as_ref() == uri);
             if matches_current || matches_active {
                 state.player_state.duration_ms = detail.summary.duration_ms;
                 state.player_state.active_track = Some(detail.clone());
@@ -2048,74 +2254,79 @@ async fn handle_internal_msg(
                 let _ = save_recent_history(&state.paths, &state.recent_history);
             }
         }
-        InternalMsg::BackendEventsBatch(res) => match res {
-            Ok(events) => {
-                for ev in events {
-                    match &ev {
-                        BackendEvent::CrateTracksPageLoaded {
-                            crate_ref,
-                            offset,
-                            total,
-                            items,
-                        } => {
-                            if *offset == 0 {
-                                state.last_crate_tracks =
-                                    Some((crate_ref.clone(), *total, items.clone()));
-                            } else if let Some((cached_ref, cached_total, cached_items)) =
-                                state.last_crate_tracks.as_mut()
-                                && crate_refs_same_target(cached_ref, crate_ref)
-                            {
-                                *cached_total = *total;
-                                if *offset <= cached_items.len() && cached_items.len() < 1000 {
-                                    cached_items.truncate(*offset);
-                                    let remaining = 1000 - cached_items.len();
-                                    cached_items.extend(items.iter().take(remaining).cloned());
+        InternalMsg::BackendEventsBatch {
+            session_gen,
+            result,
+        } => {
+            if session_gen != state.session_gen || state.session.is_none() {
+                return;
+            }
+            match result {
+                Ok(events) => {
+                    for ev in events {
+                        match &ev {
+                            BackendEvent::CrateTracksPageLoaded {
+                                crate_ref,
+                                offset,
+                                total,
+                                items,
+                            } => {
+                                if *offset == 0 {
+                                    state.last_crate_tracks =
+                                        Some((crate_ref.clone(), *total, items.clone()));
+                                } else if let Some((cached_ref, cached_total, cached_items)) =
+                                    state.last_crate_tracks.as_mut()
+                                    && crate_refs_same_target(cached_ref, crate_ref)
+                                {
+                                    *cached_total = *total;
+                                    if *offset <= cached_items.len() && cached_items.len() < 1000 {
+                                        cached_items.truncate(*offset);
+                                        let remaining = 1000 - cached_items.len();
+                                        cached_items.extend(items.iter().take(remaining).cloned());
+                                    }
+                                }
+                                if let Some(ref sess) = state.session {
+                                    prestage_track_uris(
+                                        sess,
+                                        items.iter().take(2).map(|t| t.uri.to_string()).collect(),
+                                    );
                                 }
                             }
-                            if let Some(ref sess) = state.session {
-                                prestage_track_uris(
-                                    sess,
-                                    items.iter().take(2).map(|t| t.uri.to_string()).collect(),
-                                );
+                            BackendEvent::ArtistDetailLoaded(detail) => {
+                                state.last_artist_detail = Some(detail.clone());
+                                if let Some(ref sess) = state.session {
+                                    prestage_track_uris(
+                                        sess,
+                                        detail
+                                            .top_tracks
+                                            .iter()
+                                            .take(2)
+                                            .map(|t| t.uri.to_string())
+                                            .collect(),
+                                    );
+                                }
                             }
-                        }
-                        BackendEvent::ArtistDetailLoaded(detail) => {
-                            state.last_artist_detail = Some(detail.clone());
-                            if let Some(ref sess) = state.session {
-                                prestage_track_uris(
-                                    sess,
-                                    detail
-                                        .top_tracks
-                                        .iter()
-                                        .take(2)
-                                        .map(|t| t.uri.to_string())
-                                        .collect(),
-                                );
+                            BackendEvent::SearchResultsLoaded(search) => {
+                                state.last_search_results = Some(search.clone());
+                                if let Some(ref sess) = state.session {
+                                    prestage_track_uris(
+                                        sess,
+                                        search
+                                            .tracks
+                                            .iter()
+                                            .take(2)
+                                            .map(|t| t.uri.to_string())
+                                            .collect(),
+                                    );
+                                }
                             }
+                            _ => {}
                         }
-                        BackendEvent::SearchResultsLoaded(search) => {
-                            state.last_search_results = Some(search.clone());
-                            if let Some(ref sess) = state.session {
-                                prestage_track_uris(
-                                    sess,
-                                    search
-                                        .tracks
-                                        .iter()
-                                        .take(2)
-                                        .map(|t| t.uri.to_string())
-                                        .collect(),
-                                );
-                            }
-                        }
-                        _ => {}
+                        emitter.emit(ev);
                     }
-                    emitter.emit(ev);
                 }
+                Err(err) => emitter.error(err),
             }
-            Err(err) => emitter.error(err),
-        },
-        InternalMsg::WebApiTokenRefreshed(token) => {
-            state.web_api_token = Some(token);
         }
         InternalMsg::LikeMutationFinished(res) => match res {
             Ok((uri, is_liked)) => {
@@ -2134,27 +2345,54 @@ async fn handle_internal_msg(
                 emitter.error(err);
             }
         }
-        InternalMsg::PlayCrateResolved { shuffle, result } => {
+        InternalMsg::PlayCrateResolved {
+            session_gen,
+            play_seq,
+            shuffle,
+            result,
+        } => {
+            if session_gen != state.session_gen
+                || play_seq != state.play_load_seq
+                || state.session.is_none()
+            {
+                return;
+            }
             apply_play_crate_resolved(state, shuffle, result, int_tx, emitter).await;
         }
-        InternalMsg::QueueCrateResolved(result) => match result {
-            Ok((_title, _ctx, tracks)) => {
-                for t in &tracks {
-                    state.queue.append(t.clone());
-                }
-                state.emit_queue(emitter);
-                if !state.queue.manual_items().is_empty() {
-                    sync_manual_queue_to_active_device(state).await;
-                }
+        InternalMsg::QueueCrateResolved {
+            session_gen,
+            result,
+        } => {
+            if session_gen != state.session_gen || state.session.is_none() {
+                return;
             }
-            Err(err) => emitter.error(err),
-        },
+            match result {
+                Ok((_title, _ctx, tracks)) => {
+                    for t in &tracks {
+                        state.queue.append(t.clone());
+                    }
+                    state.emit_queue(emitter);
+                    if !state.queue.manual_items().is_empty() {
+                        sync_manual_queue_to_active_device(state).await;
+                    }
+                }
+                Err(err) => emitter.error(err),
+            }
+        }
         InternalMsg::PlayTrackResolved {
+            session_gen,
+            play_seq,
             context_uri,
             track_uri,
             hint_index,
             tracks,
         } => {
+            if session_gen != state.session_gen
+                || play_seq != state.play_load_seq
+                || state.session.is_none()
+            {
+                return;
+            }
             apply_play_track_resolved(
                 state,
                 context_uri,
@@ -2167,14 +2405,26 @@ async fn handle_internal_msg(
             .await;
         }
         InternalMsg::ExecuteStagedLocalLoad {
+            session_gen,
             seq,
             request,
             sync_queue,
         } => {
-            if seq == state.play_load_seq
+            if session_gen == state.session_gen
+                && seq == state.play_load_seq
                 && state.is_remote_active().is_none()
                 && let Some(ref lp) = state.local_playback
             {
+                if state.pending_local_load_paused {
+                    state.pending_local_load_paused = false;
+                    state.pending_local_load_uri = None;
+                    state.loading_track_uri = None;
+                    state.local_player_stopped = true;
+                    state.player_state.is_playing = false;
+                    state.emit_player(emitter);
+                    state.sync_mpris(false).await;
+                    return;
+                }
                 lp.request_sink_flush();
                 state.local_player_stopped = false;
                 state.local_spirc_queue_dirty = false;
@@ -2185,8 +2435,9 @@ async fn handle_internal_msg(
                 }
             }
         }
-        InternalMsg::UnavailableRetryReady { uri } => {
-            if state.is_remote_active().is_none()
+        InternalMsg::UnavailableRetryReady { session_gen, uri } => {
+            if session_gen == state.session_gen
+                && state.is_remote_active().is_none()
                 && state.session.is_some()
                 && state.current_playing_uri.as_deref() == Some(uri.as_str())
             {
@@ -2204,8 +2455,18 @@ async fn handle_internal_msg(
                         sync_manual_queue_to_active_device(state).await;
                     }
                 } else {
+                    let max_skips = state
+                        .queue
+                        .total_context_len()
+                        .saturating_add(state.queue.manual_items().len())
+                        .max(1);
+                    state.consecutive_unavailable_skips =
+                        state.consecutive_unavailable_skips.saturating_add(1);
                     let wrap = state.player_state.repeat == RepeatMode::Context;
-                    if let Some(next) = state.queue.step_next_track(wrap) {
+                    if state.consecutive_unavailable_skips < max_skips
+                        && let Some(next) = state.queue.step_next_track(wrap)
+                        && next.uri.as_ref() != uri
+                    {
                         state.emit_queue(emitter);
                         set_optimistic_playing_track(state, &next, int_tx, emitter);
                         load_tracks_on_active_device(
@@ -2219,10 +2480,13 @@ async fn handle_internal_msg(
                         .await;
                     } else {
                         state.pending_local_load_uri = None;
+                        state.pending_local_load_paused = false;
                         state.loading_track_uri = None;
                         state.local_player_stopped = true;
                         state.player_state.is_playing = false;
+                        state.consecutive_unavailable_skips = 0;
                         state.emit_player(emitter);
+                        state.sync_mpris(false).await;
                         emitter.error(format!("Track unavailable: {uri}"));
                     }
                 }
@@ -2290,6 +2554,13 @@ async fn handle_player_event(
             {
                 return;
             }
+            if state.pending_local_load_uri.is_none()
+                && state.queue.current_uri() != Some(uri_str.as_str())
+                && state.queue.manual_items().is_empty()
+                && state.queue.total_context_len() == 0
+            {
+                state.local_queue_owned = false;
+            }
             state.pending_local_load_uri = None;
             state.active_play_request_id = Some(play_request_id);
             state.local_is_active = true;
@@ -2326,6 +2597,7 @@ async fn handle_player_event(
             state.local_is_active = true;
             state.local_player_stopped = false;
             state.loading_track_uri = None;
+            state.consecutive_unavailable_skips = 0;
             state.player_state.is_playing = true;
             state.player_state.position_ms = position_ms;
             let seeked = std::mem::take(&mut state.pending_seek_emit);
@@ -2383,6 +2655,11 @@ async fn handle_player_event(
             }
             state.loading_track_uri = None;
             if state.is_remote_active().is_none() {
+                if !state.local_queue_owned {
+                    // External Spotify Connect / Zeroconf playback owns Spirc's queue;
+                    // allow Spirc to advance to its next track without pausing it.
+                    return;
+                }
                 if state.player_state.repeat == RepeatMode::Track {
                     let cur_uri = state
                         .current_playing_uri
@@ -2438,6 +2715,13 @@ async fn handle_player_event(
             {
                 return;
             }
+            if state.pending_local_load_uri.is_none()
+                && state.queue.current_uri() != Some(uri_str.as_str())
+                && state.queue.manual_items().is_empty()
+                && state.queue.total_context_len() == 0
+            {
+                state.local_queue_owned = false;
+            }
             state.pending_local_load_uri = None;
             state.local_is_active = true;
             state.local_player_stopped = false;
@@ -2465,6 +2749,9 @@ async fn handle_player_event(
                 return;
             }
             state.player_state.position_ms = position_ms;
+            if let Some(ref mpris) = state.mpris {
+                mpris.update_position(position_ms);
+            }
             emitter.emit(BackendEvent::PositionTick { position_ms });
         }
         PlayerEvent::Seeked {
@@ -2499,7 +2786,7 @@ async fn handle_player_event(
             state.sync_mpris(false).await;
         }
         PlayerEvent::ShuffleChanged { shuffle } => {
-            if state.is_remote_active().is_none() {
+            if state.is_remote_active().is_none() && state.local_queue_owned {
                 return;
             }
             state.player_state.shuffle = shuffle;
@@ -2507,7 +2794,7 @@ async fn handle_player_event(
             state.sync_mpris(false).await;
         }
         PlayerEvent::RepeatChanged { context, track } => {
-            if state.is_remote_active().is_none() {
+            if state.is_remote_active().is_none() && state.local_queue_owned {
                 return;
             }
             state.player_state.repeat = if track {
@@ -2549,16 +2836,31 @@ async fn handle_player_event(
                 && let Some(sess) = state.session.clone()
             {
                 state.retried_unavailable_uri = Some(uri_str.clone());
+                unmark_track_staged_in_memory(&uri_str);
+                let session_gen = state.session_gen;
                 let tx = int_tx.clone();
                 tokio::task::spawn_local(async move {
                     ensure_track_playable_in_cache(&sess, &uri_str).await;
-                    let _ = tx.send(InternalMsg::UnavailableRetryReady { uri: uri_str });
+                    let _ = tx.send(InternalMsg::UnavailableRetryReady {
+                        session_gen,
+                        uri: uri_str,
+                    });
                 });
                 return;
             }
+            let max_skips = state
+                .queue
+                .total_context_len()
+                .saturating_add(state.queue.manual_items().len())
+                .max(1);
+            state.consecutive_unavailable_skips =
+                state.consecutive_unavailable_skips.saturating_add(1);
             let wrap = state.player_state.repeat == RepeatMode::Context;
             if state.is_remote_active().is_none()
+                && state.local_queue_owned
+                && state.consecutive_unavailable_skips < max_skips
                 && let Some(next) = state.queue.step_next_track(wrap)
+                && next.uri.as_ref() != uri_str
             {
                 state.emit_queue(emitter);
                 set_optimistic_playing_track(state, &next, int_tx, emitter);
@@ -2573,10 +2875,13 @@ async fn handle_player_event(
                 .await;
             } else {
                 state.pending_local_load_uri = None;
+                state.pending_local_load_paused = false;
                 state.loading_track_uri = None;
                 state.local_player_stopped = true;
                 state.player_state.is_playing = false;
+                state.consecutive_unavailable_skips = 0;
                 state.emit_player(emitter);
+                state.sync_mpris(false).await;
                 emitter.error(format!("Track unavailable: {uri_str}"));
             }
         }
@@ -2641,9 +2946,11 @@ fn cached_tracks_for_crate(
         && crate_refs_same_target(cached_ref, crate_ref)
         && !tracks.is_empty()
     {
-        let complete_enough = tracks.len() >= *total
-            || required_track_uri.is_some_and(|u| tracks.iter().any(|t| t.uri.as_ref() == u));
-        if complete_enough {
+        // Only use the page cache shortcut when the full collection is loaded so playing a track
+        // from page 0 of a >50-track playlist/Liked Songs does not truncate the queue/shuffle pool.
+        let complete = tracks.len() >= *total
+            && required_track_uri.is_none_or(|u| tracks.iter().any(|t| t.uri.as_ref() == u));
+        if complete {
             let (title, ctx_uri) = cached_crate_title_and_ctx(cached_ref);
             return Some((title, ctx_uri, tracks.clone()));
         }
@@ -2680,7 +2987,8 @@ fn find_cached_track_list_for_uri(
     {
         return Some(search.tracks.clone());
     }
-    if let Some((_, _, tracks)) = state.last_crate_tracks.as_ref()
+    if let Some((_, total, tracks)) = state.last_crate_tracks.as_ref()
+        && tracks.len() >= *total
         && tracks.iter().any(|t| t.uri.as_ref() == track_uri)
     {
         return Some(tracks.clone());
@@ -2709,11 +3017,16 @@ async fn apply_play_crate_resolved(
             let is_local = state.is_remote_active().is_none();
             state.player_state.shuffle = shuffle;
             let ctx_arc = maybe_ctx_uri.as_deref().map(Arc::from);
-            state
-                .queue
-                .set_context(title, ctx_arc, tracks.clone(), Some(0));
             if is_local && shuffle {
+                // Shuffle the full context BEFORE selecting track 0 so Shuffle Play starts on a
+                // randomized track rather than always pinning tracks[0].
+                state.queue.set_context(title, ctx_arc, tracks.clone(), None);
                 state.queue.set_shuffle(true);
+                let _ = state.queue.step_next_track(false);
+            } else {
+                state
+                    .queue
+                    .set_context(title, ctx_arc, tracks.clone(), Some(0));
             }
             state.emit_queue(emitter);
             let selected = state
@@ -2726,11 +3039,15 @@ async fn apply_play_crate_resolved(
             let loaded_now = if !is_local
                 && let Some(ctx_uri) = maybe_ctx_uri
             {
-                let first_uri = tracks[0].uri.to_string();
+                let start_uri = if shuffle {
+                    None
+                } else {
+                    Some(tracks[0].uri.to_string())
+                };
                 load_context_on_active_device(
                     state,
                     &ctx_uri,
-                    Some(first_uri),
+                    start_uri,
                     shuffle,
                     int_tx,
                     emitter,
@@ -2812,7 +3129,6 @@ async fn apply_play_track_resolved(
                 .current_track()
                 .cloned()
                 .or_else(|| play_idx.and_then(|i| resolved.get(i)).cloned())
-                .or_else(|| resolved.first().cloned())
             {
                 set_optimistic_playing_track(state, &selected, int_tx, emitter);
             }
@@ -2873,6 +3189,9 @@ async fn start_play_crate(
         emitter.error("Sign in with Spotify Premium first.");
         return;
     };
+    state.play_load_seq = state.play_load_seq.wrapping_add(1);
+    let play_seq = state.play_load_seq;
+    let session_gen = state.session_gen;
     if let Some(cached) = cached_tracks_for_crate(state, &crate_ref, None) {
         apply_play_crate_resolved(state, shuffle, Ok(cached), int_tx, emitter).await;
         return;
@@ -2887,7 +3206,12 @@ async fn start_play_crate(
             .await
             .resolve_crate_tracks(&sess, &crate_ref, &recent, sort)
             .await;
-        let _ = tx.send(InternalMsg::PlayCrateResolved { shuffle, result });
+        let _ = tx.send(InternalMsg::PlayCrateResolved {
+            session_gen,
+            play_seq,
+            shuffle,
+            result,
+        });
     });
 }
 
@@ -3113,20 +3437,29 @@ fn maybe_fetch_track_detail(
         return;
     };
     state.in_flight_detail_uri = Some(uri_str.to_string());
+    let session_gen = state.session_gen;
     let lib = Rc::clone(&state.library);
     let uri = uri_str.to_string();
     let tx = int_tx.clone();
     tokio::task::spawn_local(async move {
         let detail = lib.lock().await.resolve_track_detail(&sess, &uri).await;
-        if let Some(detail) = detail {
-            let _ = tx.send(InternalMsg::CurrentTrackDetailLoaded { uri, detail });
-        }
+        let _ = tx.send(InternalMsg::CurrentTrackDetailLoaded {
+            session_gen,
+            uri,
+            detail,
+        });
     });
 }
 
 fn enforce_audio_cache_limit(state: &BackendState) {
-    let limit_bytes = state.config.disk_audio_cache_mb.saturating_mul(1024 * 1024);
-    prune_dir_to_bytes_lru(&state.paths.audio_cache_dir, limit_bytes);
+    // Match `open_librespot_cache`'s 16 MiB floor so `disk_audio_cache_mb == 0` does not
+    // wipe active staged fallback files every 2 seconds.
+    let effective_mb = state.config.disk_audio_cache_mb.max(16);
+    let limit_bytes = effective_mb.saturating_mul(1024 * 1024);
+    let removed = prune_dir_to_bytes_lru(&state.paths.audio_cache_dir, limit_bytes);
+    if removed > 0 {
+        clear_staged_tracks_in_memory();
+    }
 }
 
 fn dispatch_local_load(
@@ -3140,10 +3473,13 @@ fn dispatch_local_load(
     };
     state.play_load_seq = state.play_load_seq.wrapping_add(1);
     let seq = state.play_load_seq;
+    let session_gen = state.session_gen;
     lp.request_sink_flush();
+    state.local_queue_owned = true;
     state.local_player_stopped = false;
     state.local_spirc_queue_dirty = false;
     state.pending_local_load_uri = target_uri.map(ToOwned::to_owned);
+    state.pending_local_load_paused = false;
     state.active_play_request_id = None;
 
     if let Some(target) = target_uri
@@ -3158,6 +3494,7 @@ fn dispatch_local_load(
         tokio::task::spawn_local(async move {
             ensure_track_playable_in_cache(&sess, &target_owned).await;
             let _ = tx.send(InternalMsg::ExecuteStagedLocalLoad {
+                session_gen,
                 seq,
                 request,
                 sync_queue,
@@ -3264,6 +3601,8 @@ async fn load_tracks_on_active_device(
 async fn sync_manual_queue_to_active_device(state: &BackendState) {
     if let Some(remote_id) = state.is_remote_active()
         && let Some(ref sess) = state.session
+        && let Some(ref meta) = state.remote_queue_meta
+        && !meta.queue_revision.is_empty()
     {
         let manual_uris: Vec<String> = state
             .queue
@@ -3271,26 +3610,18 @@ async fn sync_manual_queue_to_active_device(state: &BackendState) {
             .iter()
             .map(|t| t.uri.to_string())
             .collect();
-        if let Some(ref meta) = state.remote_queue_meta
-            && !meta.queue_revision.is_empty()
-        {
-            let mut next_tracks: Vec<serde_json::Value> = manual_uris
-                .iter()
-                .enumerate()
-                .map(|(i, u)| manual_track_to_provided_json(u, i))
-                .collect();
-            next_tracks.extend(meta.context_next_tracks.iter().cloned());
-            let payload = cmd_set_queue(
-                next_tracks,
-                meta.prev_tracks.clone(),
-                &meta.queue_revision,
-            );
-            let _ = send_remote_command(sess, &remote_id, payload).await;
-        } else {
-            for uri in manual_uris {
-                let _ = send_remote_command(sess, &remote_id, cmd_add_to_queue(&uri)).await;
-            }
-        }
+        let mut next_tracks: Vec<serde_json::Value> = manual_uris
+            .iter()
+            .enumerate()
+            .map(|(i, u)| manual_track_to_provided_json(u, i))
+            .collect();
+        next_tracks.extend(meta.context_next_tracks.iter().cloned());
+        let payload = cmd_set_queue(
+            next_tracks,
+            meta.prev_tracks.clone(),
+            &meta.queue_revision,
+        );
+        let _ = send_remote_command(sess, &remote_id, payload).await;
     }
     // Local playback drives manual + context queue directly via `TwoTierQueue` on `EndOfTrack`.
 }
@@ -3564,5 +3895,16 @@ Threads:\t2\n";
         );
         assert_eq!(q.manual_items().len(), 1);
         assert_eq!(&*q.manual_items()[0].uri, "spotify:track:m1");
+    }
+
+    #[test]
+    fn app_config_deserializes_partial_json_with_defaults() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"device_name":"Studio","gapless":false}"#).unwrap();
+        assert_eq!(cfg.device_name, "Studio");
+        assert!(!cfg.gapless);
+        assert!(cfg.zeroconf_enabled);
+        assert_eq!(cfg.stream_quality, StreamQuality::Kbps320);
+        assert_eq!(cfg.disk_audio_cache_mb, 256);
     }
 }

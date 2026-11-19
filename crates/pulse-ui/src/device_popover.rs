@@ -27,6 +27,11 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
     } else {
         &devices.local_device_name
     };
+    let local_vol_pct = if state.view.player_state.muted {
+        0
+    } else {
+        state.view.player_state.volume_pct()
+    };
     let local_row = device_row(
         local_name,
         &format!(
@@ -34,7 +39,7 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             state.view.player_state.audio_badge
         ),
         local_active,
-        state.view.player_state.volume_pct(),
+        local_vol_pct,
         (!local_active && !devices.local_device_id.is_empty()).then(|| {
             UiMsg::Command(UiCommand::TransferPlayback {
                 device_id: devices.local_device_id.clone(),
@@ -127,6 +132,7 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
         .style(theme::ghost_button)
         .on_press(UiMsg::ToggleSettings),
     ]
+    .spacing(8)
     .align_y(Alignment::Center);
 
     let panel = mouse_area(
@@ -142,11 +148,12 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             ]
             .spacing(theme::SPACE_SM),
         )
-        .width(Length::Fixed(300.0))
+        .width(Length::Fixed(332.0))
         .max_height(380.0)
         .padding(12)
         .style(theme::popover_panel),
-    );
+    )
+    .on_press(UiMsg::Noop);
 
     let anchored = container(
         column![

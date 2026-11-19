@@ -157,6 +157,7 @@ pub enum SettingsTab {
 
 /// Persistent user configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub custom_client_id: Option<String>,
     pub device_name: String,
@@ -448,21 +449,52 @@ impl<T> SparsePagedList<T> {
         self.in_flight.remove(&page_start);
     }
 
-    pub fn insert_page(&mut self, offset: usize, items: Vec<T>, total: usize) {
+    pub fn clear_all_in_flight(&mut self) {
+        self.in_flight.clear();
+    }
+
+    pub fn insert_page(&mut self, offset: usize, mut items: Vec<T>, total: usize) {
         self.total = total;
         self.in_flight.remove(&offset);
-        if !items.is_empty() || total == 0 {
-            self.pages.insert(offset, items);
+        self.in_flight.retain(|&start| start < total);
+
+        // Prune any stale pages that lie completely past the new total, and trim any straddling tail.
+        self.pages.retain(|&page_start, _| page_start < total);
+        for (&page_start, page_items) in &mut self.pages {
+            let max_len = total.saturating_sub(page_start);
+            if page_items.len() > max_len {
+                page_items.truncate(max_len);
+            }
+        }
+
+        if total == 0 {
+            self.pages.clear();
+            return;
+        }
+        if offset < total {
+            let max_len = total.saturating_sub(offset);
+            if items.len() > max_len {
+                items.truncate(max_len);
+            }
+            if !items.is_empty() {
+                self.pages.insert(offset, items);
+            }
         }
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.total {
+            return None;
+        }
         let (&page_start, items) = self.pages.range(..=index).next_back()?;
         let local_idx = index.checked_sub(page_start)?;
         items.get(local_idx)
     }
 
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.total {
+            return None;
+        }
         let (&page_start, items) = self.pages.range_mut(..=index).next_back()?;
         let local_idx = index.checked_sub(page_start)?;
         items.get_mut(local_idx)
@@ -470,19 +502,22 @@ impl<T> SparsePagedList<T> {
 
     /// Iterates currently loaded items in index order `(global_index, &T)`.
     pub fn iter_loaded(&self) -> impl Iterator<Item = (usize, &T)> {
-        self.pages.iter().flat_map(|(&start, items)| {
+        let total = self.total;
+        self.pages.iter().flat_map(move |(&start, items)| {
             items
                 .iter()
                 .enumerate()
+                .filter(move |(i, _)| start + *i < total)
                 .map(move |(i, item)| (start + i, item))
         })
     }
 
     /// Evicts cached pages farther than `keep_pages_radius` pages from `center_index`.
     pub fn evict_outside_window(&mut self, center_index: usize, keep_pages_radius: usize) {
+        let center_start = self.page_start_for(center_index);
         let span = self.page_size.saturating_mul(keep_pages_radius);
-        let min_keep = center_index.saturating_sub(span);
-        let max_keep = center_index.saturating_add(span);
+        let min_keep = center_start.saturating_sub(span);
+        let max_keep = center_start.saturating_add(span);
         self.pages
             .retain(|&page_start, _| page_start >= min_keep && page_start <= max_keep);
     }
@@ -658,6 +693,7 @@ pub enum UiCommand {
 pub enum BackendEvent {
     AuthChanged(AuthState),
     ConnectionChanged(ConnectionStatus),
+    ConfigUpdated(AppConfig),
     PlaybackChanged(PlayerState),
     PositionTick {
         position_ms: u32,
@@ -701,4 +737,40 @@ pub enum BackendEvent {
     TelemetryUpdated(TelemetrySnapshot),
     Notice(Option<String>),
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_paged_list_prunes_stale_pages_on_shrinking_total_and_aligns_eviction() {
+        let mut list = SparsePagedList::new(2);
+        list.insert_page(0, vec![10, 20], 6);
+        list.insert_page(2, vec![30, 40], 6);
+        list.insert_page(4, vec![50, 60], 6);
+        assert!(list.mark_in_flight(6));
+        assert_eq!(list.loaded_count(), 6);
+
+        // Shrinking total from 6 -> 3 truncates straddling page 2, drops page 4, and prunes in_flight >= 3.
+        list.insert_page(0, vec![10, 20], 3);
+        assert!(list.mark_in_flight(6));
+        assert_eq!(list.total(), 3);
+        assert_eq!(list.get(2), Some(&30));
+        assert_eq!(list.get(3), None);
+        assert_eq!(list.get(4), None);
+        assert_eq!(list.iter_loaded().count(), 3);
+
+        // Eviction centered at index 1 (page 0) with radius 1 keeps pages [0, 2] and drops page 4.
+        list.insert_page(2, vec![30, 40], 6);
+        list.insert_page(4, vec![50, 60], 6);
+        list.evict_outside_window(1, 1);
+        assert!(list.is_page_loaded(0));
+        assert!(list.is_page_loaded(2));
+        assert!(!list.is_page_loaded(4));
+
+        assert!(list.mark_in_flight(4));
+        list.clear_all_in_flight();
+        assert!(list.mark_in_flight(4));
+    }
 }

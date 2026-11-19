@@ -1,30 +1,53 @@
 //! Focus-guarded keyboard shortcuts and global event interceptor for `iced 0.14`.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use iced::keyboard::key::{Key, Named};
 use iced::widget::operation;
-use iced::{Event, Task, event, keyboard, mouse, window};
-use pulse_model::{AppMode, CrateRef, TrackSummary, UiCommand};
+use iced::{Event, Point, Task, event, keyboard, mouse, window};
+use pulse_model::{AppMode, AuthState, CrateRef, TrackSummary, UiCommand};
 
 use crate::message::UiMsg;
 use crate::omnibox::omnibox_entries;
 use crate::theme::TRACK_ROW_HEIGHT;
 use crate::ui_state::{
     ActivePane, UiState, id_client_id_input, id_crate_scroll, id_device_name_input,
-    id_filter_input, id_omnibox_input, id_queue_scroll,
+    id_filter_input, id_omnibox_input, id_omnibox_scroll, id_queue_scroll,
 };
+
+static LAST_CURSOR_X_BITS: AtomicU32 = AtomicU32::new(0);
+static LAST_CURSOR_Y_BITS: AtomicU32 = AtomicU32::new(0);
+
+/// Returns the most recently observed pointer position without causing redraw wakeups.
+pub fn last_cursor_pos() -> Point {
+    let x = f32::from_bits(LAST_CURSOR_X_BITS.load(Ordering::Relaxed));
+    let y = f32::from_bits(LAST_CURSOR_Y_BITS.load(Ordering::Relaxed));
+    if x.is_finite() && y.is_finite() {
+        Point::new(x, y)
+    } else {
+        Point::ORIGIN
+    }
+}
 
 /// Plain `fn` pointer passed to `iced::event::listen_with`.
 ///
-/// Only emits `UiMsg::KeyEvent` for keyboard key presses and mouse button clicks (to re-sync
-/// text-input focus if clicked outside), avoiding noisy mouse-move redraw wakeups.
+/// Tracks cursor coordinates lock-free without emitting messages on move, and emits `UiMsg::KeyEvent`
+/// only for keyboard key presses and mouse button press/release transitions.
 pub fn handle_global_event(
     event: Event,
     status: event::Status,
     _window: window::Id,
 ) -> Option<UiMsg> {
     match &event {
+        Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            LAST_CURSOR_X_BITS.store(position.x.to_bits(), Ordering::Relaxed);
+            LAST_CURSOR_Y_BITS.store(position.y.to_bits(), Ordering::Relaxed);
+            None
+        }
         Event::Keyboard(keyboard::Event::KeyPressed { .. }) => Some(UiMsg::KeyEvent(event, status)),
-        Event::Mouse(mouse::Event::ButtonPressed(_)) => Some(UiMsg::KeyEvent(event, status)),
+        Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::ButtonReleased(_)) => {
+            Some(UiMsg::KeyEvent(event, status))
+        }
         _ => None,
     }
 }
@@ -40,10 +63,9 @@ where
     F: FnMut(UiCommand) -> Task<UiMsg>,
 {
     match event {
-        Event::Mouse(mouse::Event::ButtonPressed(_)) => {
-            if state.input_focused {
-                return check_any_input_focused();
-            }
+        Event::Mouse(mouse::Event::ButtonPressed(_)) => check_any_input_focused(),
+        Event::Mouse(mouse::Event::ButtonReleased(_)) => {
+            state.dragging_queue_from = None;
             Task::none()
         }
         Event::Keyboard(keyboard::Event::KeyPressed {
@@ -61,6 +83,11 @@ where
                 Key::Character(s) if s.chars().count() == 1 => s.chars().next(),
                 _ => None,
             });
+            let is_onboarding = matches!(
+                state.view.auth_state,
+                AuthState::Unauthenticated | AuthState::WaitingOAuth { .. }
+            );
+            let mini = state.view.mode == AppMode::MiniPlayer;
 
             // 1. Esc & Ctrl+K & Ctrl+, work regardless of Status::Captured inside text_input.
             if named == Some(Named::Escape) {
@@ -70,7 +97,7 @@ where
             if modifiers.command() {
                 if let Some(c) = ch {
                     match c.to_ascii_lowercase() {
-                        'k' => {
+                        'k' if !is_onboarding && !mini => {
                             state.device_popover_open = false;
                             state.context_menu = None;
                             state.omnibox_open = true;
@@ -101,7 +128,14 @@ where
                 if len > 0 {
                     if named == Some(Named::ArrowDown) {
                         state.omnibox_selected = (state.omnibox_selected + 1) % len;
-                        return Task::none();
+                        let target_y = ((state.omnibox_selected as f32 * 38.0) - 140.0).max(0.0);
+                        return operation::scroll_to(
+                            id_omnibox_scroll(),
+                            operation::AbsoluteOffset {
+                                x: None,
+                                y: Some(target_y),
+                            },
+                        );
                     }
                     if named == Some(Named::ArrowUp) {
                         state.omnibox_selected = if state.omnibox_selected == 0 {
@@ -109,22 +143,32 @@ where
                         } else {
                             state.omnibox_selected - 1
                         };
-                        return Task::none();
+                        let target_y = ((state.omnibox_selected as f32 * 38.0) - 140.0).max(0.0);
+                        return operation::scroll_to(
+                            id_omnibox_scroll(),
+                            operation::AbsoluteOffset {
+                                x: None,
+                                y: Some(target_y),
+                            },
+                        );
                     }
                 }
                 return Task::none();
             }
 
-            // 3. Focus guard: never fire single-key shortcuts while typing or event captured.
+            // 3. Focus guard: never fire single-key shortcuts while typing, captured, modal, or onboarding.
             if status == event::Status::Captured || state.input_focused {
                 return Task::none();
             }
-            if state.settings_open || state.confirm_clear_queue_open {
+            if state.settings_open || state.confirm_clear_queue_open || is_onboarding {
                 return Task::none();
             }
 
             // 4. Modifier chords that are safe globally when not typing.
             if modifiers.alt() {
+                if mini {
+                    return Task::none();
+                }
                 return match named {
                     Some(Named::ArrowLeft) => send_cmd(UiCommand::NavigateBack),
                     Some(Named::ArrowRight) => send_cmd(UiCommand::NavigateForward),
@@ -144,7 +188,7 @@ where
                             send_cmd(UiCommand::TogglePlayPause)
                         }
                     }
-                    Named::Tab => {
+                    Named::Tab if !mini => {
                         state.active_pane = match state.active_pane {
                             ActivePane::Crate => ActivePane::Queue,
                             ActivePane::Queue => ActivePane::Crate,
@@ -154,26 +198,42 @@ where
                     Named::ArrowLeft => {
                         let step = if modifiers.shift() { 30_000 } else { 5_000 };
                         let next_ms = state.view.player_state.position_ms.saturating_sub(step);
+                        state.view.player_state.position_ms = next_ms;
                         send_cmd(UiCommand::SeekMs(next_ms))
                     }
                     Named::ArrowRight => {
                         let step = if modifiers.shift() { 30_000 } else { 5_000 };
-                        let dur = state.view.player_state.duration_ms;
-                        let next_ms = state
-                            .view
-                            .player_state
-                            .position_ms
-                            .saturating_add(step)
-                            .min(dur);
+                        let dur = if state.view.player_state.duration_ms > 0 {
+                            state.view.player_state.duration_ms
+                        } else {
+                            state
+                                .view
+                                .player_state
+                                .active_track
+                                .as_ref()
+                                .map(|t| t.summary.duration_ms)
+                                .unwrap_or(0)
+                        };
+                        let next_ms = if dur > 0 {
+                            state
+                                .view
+                                .player_state
+                                .position_ms
+                                .saturating_add(step)
+                                .min(dur)
+                        } else {
+                            state.view.player_state.position_ms.saturating_add(step)
+                        };
+                        state.view.player_state.position_ms = next_ms;
                         send_cmd(UiCommand::SeekMs(next_ms))
                     }
-                    Named::ArrowDown => move_cursor(state, 1),
-                    Named::ArrowUp => move_cursor(state, -1),
-                    Named::PageDown => move_cursor(state, 10),
-                    Named::PageUp => move_cursor(state, -10),
-                    Named::Home => jump_cursor(state, true),
-                    Named::End => jump_cursor(state, false),
-                    Named::Enter => {
+                    Named::ArrowDown if !mini => move_cursor(state, 1),
+                    Named::ArrowUp if !mini => move_cursor(state, -1),
+                    Named::PageDown if !mini => move_cursor(state, 10),
+                    Named::PageUp if !mini => move_cursor(state, -10),
+                    Named::Home if !mini => jump_cursor(state, true),
+                    Named::End if !mini => jump_cursor(state, false),
+                    Named::Enter if !mini => {
                         if repeat {
                             Task::none()
                         } else if modifiers.shift() {
@@ -183,7 +243,7 @@ where
                             activate_selected_row(state, send_cmd)
                         }
                     }
-                    Named::Delete | Named::Backspace => {
+                    Named::Delete | Named::Backspace if !mini => {
                         if repeat {
                             Task::none()
                         } else {
@@ -218,8 +278,9 @@ where
     if repeat && !matches!(ch, '-' | '=' | '+' | 'j' | 'J' | 'k' | 'K') {
         return Task::none();
     }
+    let mini = state.view.mode == AppMode::MiniPlayer;
     match ch {
-        '/' => {
+        '/' if !mini => {
             state.input_focused = true;
             operation::focus(id_filter_input())
         }
@@ -230,10 +291,9 @@ where
         '1' => switch_mode_msg(AppMode::Workbench),
         '2' => switch_mode_msg(AppMode::FocusStage),
         '3' => switch_mode_msg(AppMode::MiniPlayer),
-        'j' | 'J' => move_cursor(state, 1),
-        'k' | 'K' => move_cursor(state, -1),
-        'g' => jump_cursor(state, true),
-        'G' => jump_cursor(state, false),
+        'j' | 'J' if !mini => move_cursor(state, 1),
+        'k' | 'K' if !mini => move_cursor(state, -1),
+        'g' | 'G' if !mini => jump_cursor(state, !(modifiers.shift() || ch == 'G')),
         'f' | 'F' => {
             let next = if state.view.mode == AppMode::FocusStage {
                 AppMode::Workbench
@@ -254,9 +314,11 @@ where
                 send_cmd(UiCommand::ToggleMute)
             }
         }
-        'q' | 'Q' => {
+        'q' | 'Q' if !mini => {
             if state.view.mode == AppMode::FocusStage && !modifiers.shift() && ch == 'q' {
-                state.show_focus_queue = !state.show_focus_queue;
+                if state.window_size.width >= 900.0 {
+                    state.show_focus_queue = !state.show_focus_queue;
+                }
                 return Task::none();
             }
             if let Some(track) = selected_or_active_track(state) {
@@ -277,7 +339,7 @@ where
         }
         's' | 'S' => send_cmd(UiCommand::ToggleShuffle),
         'r' | 'R' => send_cmd(UiCommand::CycleRepeat),
-        'd' | 'D' => {
+        'd' | 'D' if !mini => {
             state.device_popover_open = !state.device_popover_open;
             if state.device_popover_open {
                 return send_cmd(UiCommand::RefreshDevices);
@@ -316,7 +378,21 @@ where
     }
     if state.input_focused || !state.view.crate_view.local_filter.is_empty() {
         state.input_focused = false;
+        let had_filter = !state.view.crate_view.local_filter.is_empty();
         state.view.crate_view.local_filter.clear();
+        if had_filter {
+            state.crate_scroll_y = 0.0;
+            return Task::batch([
+                send_cmd(UiCommand::SetLocalFilter(String::new())),
+                operation::scroll_to(
+                    id_crate_scroll(),
+                    operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(0.0),
+                    },
+                ),
+            ]);
+        }
         return send_cmd(UiCommand::SetLocalFilter(String::new()));
     }
     if state.view.mode == AppMode::MiniPlayer {
@@ -353,12 +429,16 @@ fn switch_mode_msg(mode: AppMode) -> Task<UiMsg> {
     Task::done(UiMsg::SwitchMode(mode))
 }
 
-fn adjust_volume<F>(state: &UiState, delta: i32, mut send_cmd: F) -> Task<UiMsg>
+fn adjust_volume<F>(state: &mut UiState, delta: i32, mut send_cmd: F) -> Task<UiMsg>
 where
     F: FnMut(UiCommand) -> Task<UiMsg>,
 {
     let cur = i32::from(state.view.player_state.volume);
     let next = (cur + delta).clamp(0, 65_535) as u16;
+    state.view.player_state.volume = next;
+    if next > 0 {
+        state.view.player_state.muted = false;
+    }
     send_cmd(UiCommand::SetVolume(next))
 }
 
@@ -394,6 +474,27 @@ where
     Task::none()
 }
 
+fn queue_row_bounds(state: &UiState, row_idx: usize) -> (f32, f32) {
+    let row_h = if state.view.mode == AppMode::FocusStage {
+        48.0
+    } else {
+        TRACK_ROW_HEIGHT
+    };
+    let manual_len = state.view.queue.manual_items.len();
+    let header_h = 26.0;
+    let top = if row_idx < manual_len {
+        header_h + row_idx as f32 * row_h
+    } else {
+        let mut y = 0.0;
+        if manual_len > 0 {
+            y += header_h + manual_len as f32 * row_h + 8.0;
+        }
+        y += header_h + (row_idx - manual_len) as f32 * row_h;
+        y
+    };
+    (top, row_h)
+}
+
 fn move_cursor(state: &mut UiState, delta: isize) -> Task<UiMsg> {
     match state.active_pane {
         ActivePane::Crate => update_crate_cursor_pos(state, |cur, total| match cur {
@@ -409,10 +510,11 @@ fn move_cursor(state: &mut UiState, delta: isize) -> Task<UiMsg> {
             let cur = state.selected_queue_row.unwrap_or(0) as isize;
             let next = (cur + delta).clamp(0, (total - 1) as isize) as usize;
             state.selected_queue_row = Some(next);
-            ensure_row_visible(
+            let (row_top, row_h) = queue_row_bounds(state, next);
+            ensure_span_visible(
                 id_queue_scroll(),
-                next,
-                TRACK_ROW_HEIGHT,
+                row_top,
+                row_h,
                 state.queue_scroll_y,
                 state.queue_viewport_height,
             )
@@ -432,10 +534,11 @@ fn jump_cursor(state: &mut UiState, to_start: bool) -> Task<UiMsg> {
             }
             let next = if to_start { 0 } else { total - 1 };
             state.selected_queue_row = Some(next);
-            ensure_row_visible(
+            let (row_top, row_h) = queue_row_bounds(state, next);
+            ensure_span_visible(
                 id_queue_scroll(),
-                next,
-                TRACK_ROW_HEIGHT,
+                row_top,
+                row_h,
                 state.queue_scroll_y,
                 state.queue_viewport_height,
             )
@@ -489,7 +592,22 @@ fn ensure_row_visible(
     scroll_y: f32,
     viewport_h: f32,
 ) -> Task<UiMsg> {
-    let row_top = row_idx as f32 * row_height;
+    ensure_span_visible(
+        id,
+        row_idx as f32 * row_height,
+        row_height,
+        scroll_y,
+        viewport_h,
+    )
+}
+
+fn ensure_span_visible(
+    id: iced::widget::Id,
+    row_top: f32,
+    row_height: f32,
+    scroll_y: f32,
+    viewport_h: f32,
+) -> Task<UiMsg> {
     let row_bottom = row_top + row_height;
     let vp_h = viewport_h.max(row_height);
 
@@ -640,12 +758,44 @@ where
 }
 
 fn open_selected_context_menu(state: &mut UiState) {
-    if let Some((idx, track)) = track_at_crate_cursor(state) {
-        let pos = iced::Point::new(
-            (state.stage_width + 180.0).min((state.window_size.width - 240.0).max(20.0)),
-            180.0,
-        );
-        state.context_menu = Some(crate::ui_state::TrackContextMenu { index: idx, track, pos });
+    match state.active_pane {
+        ActivePane::Queue => {
+            if let Some(idx) = state.selected_queue_row {
+                let m_len = state.view.queue.manual_items.len();
+                let track = if idx < m_len {
+                    state.view.queue.manual_items.get(idx).cloned()
+                } else {
+                    state.view.queue.context_items.get(idx - m_len).cloned()
+                };
+                if let Some(track) = track {
+                    let pos = iced::Point::new(
+                        (state.stage_width - 240.0).max(20.0),
+                        (360.0 + (idx % 6) as f32 * 40.0)
+                            .min((state.window_size.height - 270.0).max(20.0)),
+                    );
+                    state.context_menu = Some(crate::ui_state::TrackContextMenu {
+                        pane: ActivePane::Queue,
+                        index: idx,
+                        track,
+                        pos,
+                    });
+                }
+            }
+        }
+        ActivePane::Crate => {
+            if let Some((idx, track)) = track_at_crate_cursor(state) {
+                let pos = iced::Point::new(
+                    (state.stage_width + 180.0).min((state.window_size.width - 240.0).max(20.0)),
+                    180.0,
+                );
+                state.context_menu = Some(crate::ui_state::TrackContextMenu {
+                    pane: ActivePane::Crate,
+                    index: idx,
+                    track,
+                    pos,
+                });
+            }
+        }
     }
 }
 
@@ -819,6 +969,22 @@ mod tests {
             })
         };
 
+        // While unauthenticated (onboarding), single-key shortcuts are blocked.
+        let _ = dispatch_global_event(
+            &mut ui,
+            make_repeat(Key::Character("=".into()), Some("=")),
+            event::Status::Ignored,
+            |cmd| {
+                emitted.push(cmd);
+                Task::none()
+            },
+        );
+        assert!(emitted.is_empty());
+
+        ui.view.auth_state = AuthState::ConnectOnly {
+            device_name: String::from("Pulse"),
+        };
+
         let _ = dispatch_global_event(
             &mut ui,
             make_repeat(Key::Named(Named::Space), Some(" ")),
@@ -839,7 +1005,7 @@ mod tests {
         );
         assert!(emitted.is_empty());
 
-        // Continuous volume adjustment still responds to key repeat.
+        // Continuous volume adjustment still responds to key repeat once authenticated.
         let _ = dispatch_global_event(
             &mut ui,
             make_repeat(Key::Character("=".into()), Some("=")),
@@ -850,5 +1016,43 @@ mod tests {
             },
         );
         assert_eq!(emitted.len(), 1);
+
+        // Shift+G jumps to the end even when physical key to_latin() produces lowercase 'g'.
+        ui.view.crate_view.loaded_tracks.insert_page(
+            0,
+            vec![make_track("0", "A"), make_track("1", "B"), make_track("2", "C")],
+            3,
+        );
+        ui.selected_crate_row = Some(0);
+        let _ = dispatch_global_event(
+            &mut ui,
+            key_press(
+                Key::Character("g".into()),
+                Some("G"),
+                keyboard::Modifiers::SHIFT,
+            ),
+            event::Status::Ignored,
+            |_| Task::none(),
+        );
+        assert_eq!(ui.selected_crate_row, Some(2));
+
+        // Shift+Enter on Queue pane opens context menu tagged with ActivePane::Queue.
+        ui.active_pane = ActivePane::Queue;
+        ui.view.queue.manual_items = vec![make_track("q0", "Queued")];
+        ui.selected_queue_row = Some(0);
+        let _ = dispatch_global_event(
+            &mut ui,
+            key_press(
+                Key::Named(Named::Enter),
+                None,
+                keyboard::Modifiers::SHIFT,
+            ),
+            event::Status::Ignored,
+            |_| Task::none(),
+        );
+        assert_eq!(
+            ui.context_menu.as_ref().map(|m| (m.pane, m.index)),
+            Some((ActivePane::Queue, 0))
+        );
     }
 }

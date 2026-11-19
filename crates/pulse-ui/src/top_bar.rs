@@ -140,9 +140,16 @@ fn center_omnibox_bar<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
 
     let mut trailing = row![].spacing(6).align_y(Alignment::Center);
 
-    if !filter.is_empty() {
+    let is_track_crate = matches!(
+        state.view.crate_view.active_crate,
+        pulse_model::CrateRef::LikedSongs
+            | pulse_model::CrateRef::Recent
+            | pulse_model::CrateRef::Playlist { .. }
+            | pulse_model::CrateRef::Album { .. }
+    );
+    if !filter.trim().is_empty() {
         let total = state.view.crate_view.loaded_tracks.total();
-        let needle = filter.to_ascii_lowercase();
+        let needle = filter.trim().to_ascii_lowercase();
         let matched = state
             .view
             .crate_view
@@ -155,10 +162,12 @@ fn center_omnibox_bar<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             })
             .count();
 
-        trailing = trailing.push(widgets::status_badge(
-            format!("{matched} / {total}"),
-            theme::ACCENT_PRIMARY,
-        ));
+        if is_track_crate {
+            trailing = trailing.push(widgets::status_badge(
+                format!("{matched} / {total}"),
+                theme::ACCENT_PRIMARY,
+            ));
+        }
         trailing = trailing.push(
             button(widgets::icon_svg(icons::CLOSE, 12.0, theme::TEXT_SECONDARY))
                 .padding([3.0, 5.0])
@@ -184,16 +193,18 @@ fn center_omnibox_bar<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
     .style(theme::secondary_button)
     .on_press(UiMsg::OpenOmnibox);
 
-    container(
-        row![
-            widgets::icon_svg(icons::SEARCH, 14.0, theme::TEXT_MUTED),
-            input,
-            trailing,
-            omnibox_trigger,
-        ]
-        .spacing(theme::SPACE_SM)
-        .align_y(Alignment::Center),
-    )
+    let mut bar_row = row![
+        widgets::icon_svg(icons::SEARCH, 14.0, theme::TEXT_MUTED),
+        input,
+        trailing,
+    ]
+    .spacing(theme::SPACE_SM)
+    .align_y(Alignment::Center);
+    if state.window_size.width >= 680.0 {
+        bar_row = bar_row.push(omnibox_trigger);
+    }
+
+    container(bar_row)
     .width(Length::FillPortion(3))
     .max_width(520.0)
     .padding([0.0, 8.0])
@@ -230,17 +241,22 @@ fn right_cluster<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
         }
     };
 
-    let device_pill = button(
+    let compact = state.window_size.width < 680.0;
+    let device_content: Element<'a, UiMsg> = if compact {
+        widgets::icon_svg(icons::DEVICE, 14.0, dot_color)
+    } else {
         row![
             widgets::icon_svg(icons::DEVICE, 14.0, dot_color),
             widgets::status_dot_label(dot_color, dev_label, theme::TEXT_PRIMARY),
         ]
         .spacing(6)
-        .align_y(Alignment::Center),
-    )
-    .padding([5.0, 10.0])
-    .style(theme::pill_button(state.device_popover_open))
-    .on_press(UiMsg::ToggleDevicePopover);
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let device_pill = button(device_content)
+        .padding([5.0, if compact { 7.0 } else { 10.0 }])
+        .style(theme::pill_button(state.device_popover_open))
+        .on_press(UiMsg::ToggleDevicePopover);
 
     let rss_mb = state.view.telemetry.process_rss_mb;
     let rss_warn = rss_mb > 82.0;

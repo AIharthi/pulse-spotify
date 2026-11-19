@@ -187,7 +187,7 @@ pub async fn wait_for_oauth_callback(
         let listener = loop {
             match TcpListener::bind(&bind_addr) {
                 Ok(l) => break l,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 10 => {
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 20 => {
                     attempts += 1;
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -211,19 +211,24 @@ pub async fn wait_for_oauth_callback(
 
             match listener.accept() {
                 Ok((mut stream, _addr)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 4096];
-                    let n = match stream.read(&mut buf) {
-                        Ok(n) if n > 0 => n,
-                        _ => continue,
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let Some(raw_bytes) = read_http_request_head(&mut stream, &cancel) else {
+                        continue;
                     };
-                    let raw = String::from_utf8_lossy(&buf[..n]);
+                    let raw = String::from_utf8_lossy(&raw_bytes);
                     let first_line = raw.lines().next().unwrap_or("");
                     let mut parts = first_line.split_whitespace();
                     let _method = parts.next();
                     let target = parts.next().unwrap_or("/");
 
-                    let full_url = match Url::parse(&format!("http://127.0.0.1{target}")) {
+                    let full_url = if target.starts_with("http://") || target.starts_with("https://")
+                    {
+                        Url::parse(target)
+                    } else {
+                        Url::parse(&format!("http://127.0.0.1{target}"))
+                    };
+                    let full_url = match full_url {
                         Ok(u) => u,
                         Err(_) => {
                             write_http_response(&mut stream, 400, "Invalid callback request.");
@@ -236,7 +241,21 @@ pub async fn wait_for_oauth_callback(
                         continue;
                     }
 
-                    let params: HashMap<String, String> = full_url.query_pairs().into_owned().collect();
+                    let params: HashMap<String, String> =
+                        full_url.query_pairs().into_owned().collect();
+
+                    // Validate CSRF `state` BEFORE honoring `error` or `code`, and ignore forged
+                    // requests instead of aborting the user's in-progress OAuth flow.
+                    let state = params.get("state").map(String::as_str).unwrap_or("");
+                    if state != expected_state {
+                        write_http_response(
+                            &mut stream,
+                            400,
+                            "OAuth state mismatch. Please retry login in Pulse.",
+                        );
+                        continue;
+                    }
+
                     if let Some(err) = params.get("error") {
                         write_http_response(
                             &mut stream,
@@ -250,15 +269,6 @@ pub async fn wait_for_oauth_callback(
                         write_http_response(&mut stream, 400, "Missing authorization code.");
                         continue;
                     };
-                    let state = params.get("state").map(String::as_str).unwrap_or("");
-                    if state != expected_state {
-                        write_http_response(
-                            &mut stream,
-                            400,
-                            "OAuth state mismatch. Please retry login in Pulse.",
-                        );
-                        return Err("OAuth CSRF state mismatch".to_string());
-                    }
 
                     write_http_response(
                         &mut stream,
@@ -280,6 +290,62 @@ pub async fn wait_for_oauth_callback(
     .map_err(|e| format!("OAuth callback task failed: {e}"))?
 }
 
+fn read_http_request_head(
+    stream: &mut std::net::TcpStream,
+    cancel: &OAuthCancelToken,
+) -> Option<Vec<u8>> {
+    const MAX_REQ_HEAD_BYTES: usize = 16 * 1024;
+    let mut out = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    let read_deadline = std::time::Instant::now() + Duration::from_secs(2);
+
+    while out.len() < MAX_REQ_HEAD_BYTES {
+        if cancel.is_cancelled() || std::time::Instant::now() >= read_deadline {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&chunk[..n]);
+                if out.windows(4).any(|w| w == b"\r\n\r\n")
+                    || out.windows(2).any(|w| w == b"\n\n")
+                {
+                    break;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if out.windows(2).any(|w| w == b"\r\n") {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => return None,
+        }
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn html_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn write_http_response(stream: &mut std::net::TcpStream, status: u16, message: &str) {
     let reason = match status {
         200 => "OK",
@@ -287,12 +353,13 @@ fn write_http_response(stream: &mut std::net::TcpStream, status: u16, message: &
         404 => "Not Found",
         _ => "Error",
     };
+    let safe_message = html_escape(message);
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pulse Spotify</title>\
          <style>body{{font-family:sans-serif;background:#121316;color:#f4f4f5;\
          display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}\
          .card{{background:#1b1d22;padding:28px 34px;border-radius:12px;border:1px solid #2b2e36;}}</style>\
-         </head><body><div class=\"card\"><h3>Pulse</h3><p>{message}</p></div></body></html>"
+         </head><body><div class=\"card\"><h3>Pulse</h3><p>{safe_message}</p></div></body></html>"
     );
     let reply = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
@@ -350,9 +417,9 @@ async fn request_spotify_token(
         .body(Bytes::from(form_body))
         .map_err(|e| format!("failed to build token request: {e}"))?;
 
-    let body_bytes = http
-        .request_body(req)
+    let body_bytes = tokio::time::timeout(Duration::from_secs(20), http.request_body(req))
         .await
+        .map_err(|_| "Spotify token exchange timed out".to_string())?
         .map_err(|e| format!("Spotify token exchange failed: {e}"))?;
 
     let payload: SpotifyTokenPayload = serde_json::from_slice(&body_bytes)
@@ -404,7 +471,8 @@ pub async fn connect_and_verify_session(
         .unwrap_or(creds);
 
     // `PacketType::ProductInfo` arrives asynchronously right after AP login and shuts down
-    // the session inside DispatchTask if `type != "premium"`.
+    // the session inside DispatchTask if `type != "premium"` (shortly before writing
+    // `user_attributes`). Give one brief yield after `is_invalid()` so `type` is observed.
     let mut account_type: Option<String> = None;
     for _ in 0..60 {
         if let Some(ty) = session.get_user_attribute("type") {
@@ -412,6 +480,8 @@ pub async fn connect_and_verify_session(
             break;
         }
         if session.is_invalid() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            account_type = session.get_user_attribute("type");
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -420,7 +490,7 @@ pub async fn connect_and_verify_session(
     let username = session.username();
     if let Some(ty) = account_type {
         if ty != "premium" {
-            local_playback.shutdown();
+            local_playback.shutdown().await;
             session.shutdown();
             return Ok(ConnectOutcome::NonPremium {
                 username,
@@ -436,7 +506,7 @@ pub async fn connect_and_verify_session(
     }
 
     if session.is_invalid() {
-        local_playback.shutdown();
+        local_playback.shutdown().await;
         session.shutdown();
         return Err(
             "Spotify rejected this session (Spotify Premium is required for direct streaming)."

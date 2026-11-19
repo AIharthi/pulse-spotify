@@ -1,14 +1,17 @@
 //! Presentation state, virtual-scroll metrics, widget IDs, and single-thread Tokio executor.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use iced::widget::Id;
 use iced::{Executor, Point, Size, window};
 use pulse_model::{
-    AppMode, AppViewState, BackendEvent, CrateRef, LibraryScope, SettingsTab, TrackSummary,
+    AppMode, AppViewState, AuthState, BackendEvent, ConnectionStatus, CrateRef, CrateViewState,
+    LibraryScope, SettingsTab, TrackSummary,
 };
 
-use crate::cover_store::CoverHandleCache;
+use crate::cover_store::{CoverHandleCache, CoverTier};
 
 /// Widget identifiers used for programmatic focus and scroll operations in `iced 0.14`.
 pub fn id_filter_input() -> Id {
@@ -17,6 +20,10 @@ pub fn id_filter_input() -> Id {
 
 pub fn id_omnibox_input() -> Id {
     Id::new("pulse-omnibox-input")
+}
+
+pub fn id_omnibox_scroll() -> Id {
+    Id::new("pulse-omnibox-scroll")
 }
 
 pub fn id_crate_scroll() -> Id {
@@ -73,6 +80,7 @@ pub enum ActivePane {
 /// Floating context menu state opened on right-click or `Shift+Enter`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackContextMenu {
+    pub pane: ActivePane,
     pub index: usize,
     pub track: TrackSummary,
     pub pos: Point,
@@ -102,6 +110,7 @@ pub struct UiState {
     pub queue_viewport_height: f32,
     pub selected_crate_row: Option<usize>,
     pub hovered_track_row: Option<usize>,
+    pub mini_player_hovered: bool,
     pub selected_queue_row: Option<usize>,
     pub dragging_queue_from: Option<usize>,
 
@@ -122,7 +131,9 @@ pub struct UiState {
     pub cursor_pos: Point,
     pub last_radial_accent: Option<[u8; 4]>,
     pub status_toast: Option<String>,
+    pub dismissed_conn_error: Option<String>,
     pub scrubbing_pos_ms: Option<u32>,
+    pub failed_covers: HashMap<(CoverTier, Arc<str>), Instant>,
 }
 
 impl Default for UiState {
@@ -164,6 +175,7 @@ impl UiState {
             queue_viewport_height: 300.0,
             selected_crate_row: Some(0),
             hovered_track_row: None,
+            mini_player_hovered: false,
             selected_queue_row: None,
             dragging_queue_from: None,
             input_focused: false,
@@ -180,7 +192,9 @@ impl UiState {
             cursor_pos: Point::ORIGIN,
             last_radial_accent: None,
             status_toast: None,
+            dismissed_conn_error: None,
             scrubbing_pos_ms: None,
+            failed_covers: HashMap::new(),
         }
     }
 
@@ -258,14 +272,63 @@ impl UiState {
         self.stage_width = width.clamp(Self::STAGE_MIN_WIDTH, Self::STAGE_MAX_WIDTH);
     }
 
+    /// Clears library caches and transient overlays on sign-out.
+    pub fn reset_for_sign_out(&mut self) {
+        self.view.crate_view = CrateViewState::default();
+        self.view.queue = pulse_model::QueueState::default();
+        self.view.player_state = pulse_model::PlayerState::default();
+        self.covers.purge();
+        self.last_radial_accent = None;
+        self.crate_scroll_y = 0.0;
+        self.queue_scroll_y = 0.0;
+        self.selected_crate_row = None;
+        self.selected_queue_row = None;
+        self.hovered_track_row = None;
+        self.mini_player_hovered = false;
+        self.dragging_queue_from = None;
+        self.scrubbing_pos_ms = None;
+        self.settings_open = false;
+        self.device_popover_open = false;
+        self.omnibox_open = false;
+        self.context_menu = None;
+        self.confirm_clear_queue_open = false;
+        self.show_narrow_queue = false;
+        self.input_focused = false;
+        self.failed_covers.clear();
+    }
+
     /// Applies an asynchronous `BackendEvent` into `AppViewState` and syncs UI invariants.
     pub fn apply_backend_event(&mut self, ev: BackendEvent) {
         match ev {
             BackendEvent::AuthChanged(auth) => {
+                let was_authed = matches!(self.view.auth_state, AuthState::Authenticated { .. });
+                let is_authed = matches!(auth, AuthState::Authenticated { .. });
+                let is_unauthed = matches!(auth, AuthState::Unauthenticated);
                 self.view.auth_state = auth;
+                if (was_authed && !is_authed) || is_unauthed {
+                    self.reset_for_sign_out();
+                }
             }
             BackendEvent::ConnectionChanged(conn) => {
+                match &conn {
+                    ConnectionStatus::Error(err) => {
+                        if self.dismissed_conn_error.as_deref() != Some(err.as_str()) {
+                            self.dismissed_conn_error = None;
+                        }
+                    }
+                    _ => {
+                        self.dismissed_conn_error = None;
+                    }
+                }
                 self.view.connection = conn;
+            }
+            BackendEvent::ConfigUpdated(cfg) => {
+                if !self.input_focused {
+                    self.settings_client_id_draft =
+                        cfg.custom_client_id.clone().unwrap_or_default();
+                    self.settings_device_name_draft = cfg.device_name.clone();
+                }
+                self.view.config = cfg;
             }
             BackendEvent::PlaybackChanged(player) => {
                 let prev_uri = self
@@ -284,7 +347,19 @@ impl UiState {
                 self.view.player_state.position_ms = position_ms;
             }
             BackendEvent::QueueChanged(queue) => {
-                let total = queue.manual_items.len() + queue.context_items.len();
+                let manual_len = queue.manual_items.len();
+                let ctx_len = queue.context_items.len();
+                let total = manual_len + ctx_len;
+                let headers = usize::from(manual_len > 0) + usize::from(ctx_len > 0);
+                let row_h = if self.view.mode == AppMode::FocusStage {
+                    48.0
+                } else {
+                    44.0
+                };
+                let content_h = total as f32 * row_h + headers as f32 * 26.0;
+                let max_scroll = (content_h - self.queue_viewport_height).max(0.0);
+                self.queue_scroll_y = self.queue_scroll_y.min(max_scroll);
+
                 self.view.queue = queue;
                 if total == 0 {
                     self.selected_queue_row = None;
@@ -308,7 +383,9 @@ impl UiState {
                 total,
             } => {
                 let cv = &mut self.view.crate_view;
-                let crate_changed = !same_crate_target(&cv.active_crate, &crate_ref);
+                if !same_crate_target(&cv.active_crate, &crate_ref) {
+                    return;
+                }
                 cv.active_crate = crate_ref.clone();
                 cv.active_scope = scope_for_crate(&crate_ref);
                 cv.title = title;
@@ -316,14 +393,15 @@ impl UiState {
                 cv.cover = cover;
                 cv.is_loading = false;
                 cv.error = None;
-                if crate_changed {
-                    cv.loaded_tracks.clear();
-                    cv.artist_detail = None;
-                    self.crate_scroll_y = 0.0;
-                    self.selected_crate_row = if total > 0 { Some(0) } else { None };
-                    self.hovered_track_row = None;
+                if matches!(
+                    crate_ref,
+                    CrateRef::LikedSongs
+                        | CrateRef::Playlist { .. }
+                        | CrateRef::Album { .. }
+                        | CrateRef::Recent
+                ) {
+                    cv.loaded_tracks.set_total(total);
                 }
-                cv.loaded_tracks.set_total(total);
                 self.sync_history_target(crate_ref);
             }
             BackendEvent::CrateTracksPageLoaded {
@@ -354,15 +432,16 @@ impl UiState {
             } => {
                 let cv = &mut self.view.crate_view;
                 cv.playlists.insert_page(offset, items, total);
-                cv.active_crate = CrateRef::PlaylistsIndex;
-                cv.active_scope = LibraryScope::Playlists;
-                cv.title = String::from("Playlists");
-                cv.subtitle = format!("{total} playlists");
-                cv.cover = None;
-                cv.artist_detail = None;
-                cv.is_loading = false;
-                cv.error = None;
-                self.sync_history_target(CrateRef::PlaylistsIndex);
+                if same_crate_target(&cv.active_crate, &CrateRef::PlaylistsIndex) {
+                    cv.active_scope = LibraryScope::Playlists;
+                    cv.title = String::from("Playlists");
+                    cv.subtitle = format!("{total} playlists");
+                    cv.cover = None;
+                    cv.artist_detail = None;
+                    cv.is_loading = false;
+                    cv.error = None;
+                    self.sync_history_target(CrateRef::PlaylistsIndex);
+                }
             }
             BackendEvent::AlbumsPageLoaded {
                 offset,
@@ -371,15 +450,16 @@ impl UiState {
             } => {
                 let cv = &mut self.view.crate_view;
                 cv.albums.insert_page(offset, items, total);
-                cv.active_crate = CrateRef::AlbumsIndex;
-                cv.active_scope = LibraryScope::Albums;
-                cv.title = String::from("Albums");
-                cv.subtitle = format!("{total} albums");
-                cv.cover = None;
-                cv.artist_detail = None;
-                cv.is_loading = false;
-                cv.error = None;
-                self.sync_history_target(CrateRef::AlbumsIndex);
+                if same_crate_target(&cv.active_crate, &CrateRef::AlbumsIndex) {
+                    cv.active_scope = LibraryScope::Albums;
+                    cv.title = String::from("Albums");
+                    cv.subtitle = format!("{total} albums");
+                    cv.cover = None;
+                    cv.artist_detail = None;
+                    cv.is_loading = false;
+                    cv.error = None;
+                    self.sync_history_target(CrateRef::AlbumsIndex);
+                }
             }
             BackendEvent::ArtistsPageLoaded {
                 offset,
@@ -388,15 +468,16 @@ impl UiState {
             } => {
                 let cv = &mut self.view.crate_view;
                 cv.artists.insert_page(offset, items, total);
-                cv.active_crate = CrateRef::ArtistsIndex;
-                cv.active_scope = LibraryScope::Artists;
-                cv.title = String::from("Artists");
-                cv.subtitle = format!("{total} artists");
-                cv.cover = None;
-                cv.artist_detail = None;
-                cv.is_loading = false;
-                cv.error = None;
-                self.sync_history_target(CrateRef::ArtistsIndex);
+                if same_crate_target(&cv.active_crate, &CrateRef::ArtistsIndex) {
+                    cv.active_scope = LibraryScope::Artists;
+                    cv.title = String::from("Artists");
+                    cv.subtitle = format!("{total} artists");
+                    cv.cover = None;
+                    cv.artist_detail = None;
+                    cv.is_loading = false;
+                    cv.error = None;
+                    self.sync_history_target(CrateRef::ArtistsIndex);
+                }
             }
             BackendEvent::ArtistDetailLoaded(detail) => {
                 let target = CrateRef::Artist {
@@ -404,6 +485,9 @@ impl UiState {
                     name: detail.artist.name.clone(),
                 };
                 let cv = &mut self.view.crate_view;
+                if !same_crate_target(&cv.active_crate, &target) {
+                    return;
+                }
                 cv.active_scope = LibraryScope::Artists;
                 cv.active_crate = target.clone();
                 cv.title = detail.artist.name.clone();
@@ -421,6 +505,11 @@ impl UiState {
                     query: query.clone(),
                 };
                 let cv = &mut self.view.crate_view;
+                if !same_crate_target(&cv.active_crate, &target)
+                    && !(matches!(cv.active_crate, CrateRef::Search { ref query } if query.is_empty()))
+                {
+                    return;
+                }
                 cv.active_scope = LibraryScope::Search;
                 cv.active_crate = target.clone();
                 cv.title = if query.is_empty() {
@@ -444,7 +533,12 @@ impl UiState {
                 self.view.notice_banner = notice;
             }
             BackendEvent::Error(err) => {
-                self.view.crate_view.is_loading = false;
+                let cv = &mut self.view.crate_view;
+                cv.is_loading = false;
+                cv.loaded_tracks.clear_all_in_flight();
+                cv.playlists.clear_all_in_flight();
+                cv.albums.clear_all_in_flight();
+                cv.artists.clear_all_in_flight();
                 self.view.notice_banner = Some(err);
             }
         }
@@ -570,6 +664,18 @@ mod tests {
         const { assert!(UiState::WORKBENCH_MIN_SIZE.width < 860.0) };
 
         let mut ui = UiState::default();
+        // Background PlaylistsPageLoaded while viewing LikedSongs populates cache without hijacking active_crate.
+        ui.apply_backend_event(BackendEvent::PlaylistsPageLoaded {
+            offset: 0,
+            total: 3,
+            items: Vec::new(),
+        });
+        assert_eq!(ui.view.crate_view.active_crate, CrateRef::LikedSongs);
+        assert_eq!(ui.view.crate_view.playlists.total(), 3);
+
+        // When PlaylistsIndex is the active crate, loading completes and updates history.
+        ui.view.crate_view.active_crate = CrateRef::PlaylistsIndex;
+        ui.view.crate_view.is_loading = true;
         ui.apply_backend_event(BackendEvent::PlaylistsPageLoaded {
             offset: 0,
             total: 3,
@@ -577,12 +683,14 @@ mod tests {
         });
         assert_eq!(ui.view.crate_view.active_crate, CrateRef::PlaylistsIndex);
         assert_eq!(ui.view.crate_view.active_scope, LibraryScope::Playlists);
+        assert!(!ui.view.crate_view.is_loading);
         assert_eq!(
             ui.view.crate_view.history,
             vec![CrateRef::LikedSongs, CrateRef::PlaylistsIndex]
         );
         assert_eq!(ui.view.crate_view.history_index, 1);
 
+        ui.view.crate_view.active_crate = CrateRef::AlbumsIndex;
         ui.apply_backend_event(BackendEvent::AlbumsPageLoaded {
             offset: 0,
             total: 2,
@@ -598,6 +706,7 @@ mod tests {
         assert_eq!(ui.view.crate_view.history_index, 2);
         assert_eq!(ui.step_history(true), None);
 
+        ui.view.crate_view.active_crate = CrateRef::ArtistsIndex;
         ui.apply_backend_event(BackendEvent::ArtistsPageLoaded {
             offset: 0,
             total: 1,
@@ -605,6 +714,25 @@ mod tests {
         });
         assert_eq!(ui.view.crate_view.active_crate, CrateRef::ArtistsIndex);
         assert_eq!(ui.view.crate_view.active_scope, LibraryScope::Artists);
+
+        // Stale CrateTracksPageLoaded for another crate does not overwrite active crate.
+        ui.apply_backend_event(BackendEvent::CrateTracksPageLoaded {
+            crate_ref: CrateRef::Recent,
+            offset: 0,
+            total: 5,
+            items: vec![sample_track("stale")],
+        });
+        assert_eq!(ui.view.crate_view.active_crate, CrateRef::ArtistsIndex);
+        assert_eq!(ui.view.crate_view.loaded_tracks.total(), 0);
+
+        // Sign-out resets library, queue, and transient modals.
+        ui.view.auth_state = AuthState::ConnectOnly {
+            device_name: String::from("Pulse"),
+        };
+        ui.omnibox_open = true;
+        ui.apply_backend_event(BackendEvent::AuthChanged(AuthState::Unauthenticated));
+        assert!(!ui.omnibox_open);
+        assert_eq!(ui.view.crate_view.playlists.total(), 0);
     }
 
     #[test]

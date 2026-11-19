@@ -291,11 +291,12 @@ pub fn clear_audio_cache_dir(paths: &AppPaths) -> io::Result<()> {
 }
 
 /// Evicts oldest regular files recursively under `dir` until total bytes `<= target_max_bytes`.
-pub fn prune_dir_to_bytes_lru(dir: &Path, target_max_bytes: u64) {
+/// Returns the number of files removed.
+pub fn prune_dir_to_bytes_lru(dir: &Path, target_max_bytes: u64) -> usize {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     if !dir.exists() {
-        return;
+        return 0;
     }
     let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -320,14 +321,17 @@ pub fn prune_dir_to_bytes_lru(dir: &Path, target_max_bytes: u64) {
 
     files.sort_by_key(|(mtime, _, _)| *mtime);
     let mut current: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let mut removed = 0usize;
     for (_, len, path) in files {
         if current <= target_max_bytes {
             break;
         }
         if fs::remove_file(path).is_ok() {
             current = current.saturating_sub(len);
+            removed += 1;
         }
     }
+    removed
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
@@ -342,7 +346,9 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
 pub fn write_atomic(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
     use std::io::Write;
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)?;
     }
     let tmp_name = format!(
@@ -360,17 +366,24 @@ pub fn write_atomic(path: &Path, contents: &[u8], private: bool) -> io::Result<(
         opts.mode(0o600);
     }
 
-    let mut file = opts.open(&tmp_path)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    drop(file);
+    let write_res = (|| -> io::Result<()> {
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
 
-    #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    write_res
 }

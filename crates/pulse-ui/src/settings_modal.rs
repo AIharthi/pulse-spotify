@@ -57,13 +57,17 @@ pub fn view<'a>(state: &'a UiState) -> Element<'a, UiMsg> {
             ]
             .spacing(theme::SPACE_MD),
         )
-        .width(Length::Fixed(640.0))
-        .height(Length::Fixed(540.0))
+        .width(Length::Fill)
+        .max_width(640.0)
+        .height(Length::Fill)
+        .max_height(540.0)
         .padding(18)
         .style(theme::modal_sheet),
-    );
+    )
+    .on_press(UiMsg::Noop);
 
     let backdrop = container(sheet)
+        .padding(16)
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
