@@ -513,7 +513,7 @@ async fn actor_main(
     let initial_vol = open_librespot_cache(&paths, &config)
         .ok()
         .and_then(|c| c.volume())
-        .unwrap_or(49_151);
+        .unwrap_or(65_535);
 
     let mut state = BackendState {
         paths,

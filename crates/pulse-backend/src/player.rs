@@ -205,7 +205,7 @@ pub fn build_player_config(config: &AppConfig) -> PlayerConfig {
         gapless: config.gapless,
         normalisation,
         normalisation_type,
-        normalisation_method: NormalisationMethod::Dynamic,
+        normalisation_method: NormalisationMethod::Basic,
         position_update_interval: Some(Duration::from_millis(250)),
         ..Default::default()
     }
@@ -332,8 +332,11 @@ pub async fn start_local_playback(
     let sink_flush_for_closure = Arc::clone(&sink_flush);
 
     let mixer = Arc::new(
-        SoftMixer::open(MixerConfig::default())
-            .map_err(|e| format!("failed to open SoftMixer: {e}"))?,
+        SoftMixer::open(MixerConfig {
+            volume_ctrl: spotatui_librespot_playback::config::VolumeCtrl::Linear,
+            ..MixerConfig::default()
+        })
+        .map_err(|e| format!("failed to open SoftMixer: {e}"))?,
     );
     mixer.set_volume(initial_volume);
 
