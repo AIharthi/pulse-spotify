@@ -7,7 +7,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use pulse_assets::{AdaptiveThemeTokens, icons};
 use pulse_model::{
-    AccentSource, AuthState, NormalisationMode, SettingsTab, SleepTimerTarget,
+    AccentSource, AuthState, Mp3Quality, NormalisationMode, SettingsTab, SleepTimerTarget,
     StreamQuality, ThemePreference, TrackSummary, UiCommand, VisualizerMode,
 };
 
@@ -200,6 +200,145 @@ pub fn open_add_to_playlist_popover(anchor: &impl IsA<gtk4::Widget>, bridge: &Ui
     pop.popup();
 }
 
+/// Builds an interactive popover with quality and SponsorBlock trim options to export a YouTube track as MP3.
+pub fn open_save_mp3_popover(
+    anchor: &impl IsA<gtk4::Widget>,
+    bridge: &UiBridge,
+    track: TrackSummary,
+) {
+    let (init_quality, init_strip, dl_dir) = {
+        let s = bridge.store.borrow();
+        (
+            s.view.config.mp3_quality,
+            s.view.config.mp3_strip_sponsors,
+            s.view.config.mp3_download_dir.clone(),
+        )
+    };
+    let chosen_q = std::rc::Rc::new(std::cell::Cell::new(init_quality));
+    let chosen_strip = std::rc::Rc::new(std::cell::Cell::new(init_strip));
+
+    let pop = gtk4::Popover::new();
+    pop.set_parent(anchor);
+    let box_v = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    box_v.set_size_request(276, -1);
+
+    let kicker = gtk4::Label::new(Some("Save YouTube MP3"));
+    kicker.set_css_classes(&["section-kicker"]);
+    kicker.set_xalign(0.0);
+    box_v.append(&kicker);
+
+    let tr_lbl = gtk4::Label::new(Some(&track.title));
+    tr_lbl.set_css_classes(&["heading-md"]);
+    tr_lbl.set_xalign(0.0);
+    tr_lbl.set_ellipsize(pango::EllipsizeMode::End);
+    box_v.append(&tr_lbl);
+
+    let q_hdr = gtk4::Label::new(Some("Bitrate / Profile"));
+    q_hdr.set_css_classes(&["text-secondary"]);
+    q_hdr.set_xalign(0.0);
+    box_v.append(&q_hdr);
+
+    let q_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    q_row.add_css_class("mode-seg");
+    let q_btns: std::rc::Rc<std::cell::RefCell<Vec<(Mp3Quality, gtk4::Button)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    for q in Mp3Quality::ALL {
+        let btn = gtk4::Button::with_label(q.short_label());
+        btn.set_css_classes(if q == init_quality {
+            &["seg-btn", "active"]
+        } else {
+            &["seg-btn"]
+        });
+        btn.set_hexpand(true);
+        make_clickable(&btn, &format!("Set MP3 quality {}", q.label()));
+        let cq = std::rc::Rc::clone(&chosen_q);
+        let q_btns_c = std::rc::Rc::clone(&q_btns);
+        let b_q = bridge.clone();
+        btn.connect_clicked(move |_| {
+            cq.set(q);
+            for (item_q, b) in q_btns_c.borrow().iter() {
+                if *item_q == q {
+                    b.add_css_class("active");
+                } else {
+                    b.remove_css_class("active");
+                }
+            }
+            (b_q.send)(UiCommand::SetMp3Quality(q));
+        });
+        q_row.append(&btn);
+        q_btns.borrow_mut().push((q, btn));
+    }
+    box_v.append(&q_row);
+
+    let strip_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let strip_lbl = gtk4::Label::new(Some("Cut Sponsor Segments"));
+    strip_lbl.set_css_classes(&["text-secondary"]);
+    strip_lbl.set_hexpand(true);
+    strip_lbl.set_xalign(0.0);
+    let strip_sw = gtk4::Switch::new();
+    strip_sw.add_css_class("pulse-switch");
+    strip_sw.set_active(init_strip);
+    let cs = std::rc::Rc::clone(&chosen_strip);
+    let b_s = bridge.clone();
+    strip_sw.connect_state_set(move |_, active| {
+        cs.set(active);
+        (b_s.send)(UiCommand::SetMp3StripSponsors(active));
+        glib::Propagation::Proceed
+    });
+    strip_row.append(&strip_lbl);
+    strip_row.append(&strip_sw);
+    box_v.append(&strip_row);
+
+    let save_dir_btn = gtk4::Button::with_label("Save MP3 to Downloads Folder");
+    save_dir_btn.set_css_classes(&["accent-btn"]);
+    make_clickable(&save_dir_btn, "Encode and save MP3 into configured download folder");
+    let cq_dl = std::rc::Rc::clone(&chosen_q);
+    let cs_dl = std::rc::Rc::clone(&chosen_strip);
+    let tr_dl = track.clone();
+    let b_dl = bridge.clone();
+    let pop_dl = pop.clone();
+    save_dir_btn.connect_clicked(move |_| {
+        b_dl.record_action("mp3:quick-save");
+        (b_dl.send)(UiCommand::SaveYouTubeMp3 {
+            track: tr_dl.clone(),
+            dest_path: None,
+            quality: Some(cq_dl.get()),
+            strip_sponsors: Some(cs_dl.get()),
+        });
+        pop_dl.popdown();
+    });
+    box_v.append(&save_dir_btn);
+
+    let folder_hint = gtk4::Label::new(Some(if dl_dir.is_empty() {
+        "Default music download folder"
+    } else {
+        dl_dir.as_str()
+    }));
+    folder_hint.set_css_classes(&["mono", "text-muted"]);
+    folder_hint.set_xalign(0.0);
+    folder_hint.set_ellipsize(pango::EllipsizeMode::Middle);
+    box_v.append(&folder_hint);
+
+    let save_as_btn = gtk4::Button::with_label("Save MP3 As...");
+    save_as_btn.set_css_classes(&["ctrl-btn"]);
+    make_clickable(&save_as_btn, "Choose exact filename and destination folder");
+    let cq_as = std::rc::Rc::clone(&chosen_q);
+    let cs_as = std::rc::Rc::clone(&chosen_strip);
+    let tr_as = track;
+    let b_as = bridge.clone();
+    let pop_as = pop.clone();
+    save_as_btn.connect_clicked(move |_| {
+        b_as.record_action("mp3:save-as");
+        pop_as.popdown();
+        (b_as.save_mp3_as_dialog)(tr_as.clone(), cq_as.get(), cs_as.get());
+    });
+    box_v.append(&save_as_btn);
+
+    pop.set_child(Some(&box_v));
+    pop.connect_closed(|p| p.unparent());
+    pop.popup();
+}
+
 /// Settings Modal (`Sources & Folders`, `Spotify Account & Connect`, `Audio & Appearance`, `Memory & Cache`).
 pub struct SettingsModalController {
     dialog: gtk4::Window,
@@ -213,7 +352,7 @@ impl SettingsModalController {
         let dialog = gtk4::Window::builder()
             .transient_for(parent)
             .modal(true)
-            .title("Pulse Settings")
+            .title("Aplayer Settings")
             .default_width(680)
             .default_height(520)
             .hide_on_close(true)
@@ -403,12 +542,119 @@ impl SettingsModalController {
         }
 
         let stream_info = gtk4::Label::new(Some(
-            "YouTube (InnerTube search, playlists, full-length audio) and SoundCloud (search, URLs, sets) run natively with zero account setup.",
+            "YouTube (ad-free InnerTube search, playlists, MP3 export, SponsorBlock) and SoundCloud (search, URLs, sets) run natively with zero account setup.",
         ));
         stream_info.set_css_classes(&["text-secondary"]);
         stream_info.set_wrap(true);
         stream_info.set_xalign(0.0);
         self.body_box.append(&stream_info);
+
+        // YouTube MP3 Export & Ad-Free Shield settings card
+        let cfg = { bridge.store.borrow().view.config.clone() };
+        let mp3_card = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        mp3_card.add_css_class("surface-elevated");
+
+        let card_title = gtk4::Label::new(Some("YouTube MP3 Export & Ad-Free Shield"));
+        card_title.set_css_classes(&["heading-md"]);
+        card_title.set_xalign(0.0);
+        mp3_card.append(&card_title);
+
+        let dl_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let dl_lbl = gtk4::Label::new(Some(&cfg.mp3_download_dir));
+        dl_lbl.set_css_classes(&["mono", "text-secondary"]);
+        dl_lbl.set_hexpand(true);
+        dl_lbl.set_xalign(0.0);
+        dl_lbl.set_ellipsize(pango::EllipsizeMode::Middle);
+        let dl_btn = gtk4::Button::with_label("Change Folder");
+        dl_btn.set_css_classes(&["ctrl-btn"]);
+        make_clickable(&dl_btn, "Choose MP3 download folder");
+        let b_dl = bridge.clone();
+        dl_btn.connect_clicked(move |_| (b_dl.choose_mp3_dir_dialog)());
+        dl_row.append(&dl_lbl);
+        dl_row.append(&dl_btn);
+        mp3_card.append(&dl_row);
+
+        let q_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let q_lbl = gtk4::Label::new(Some("Default MP3 Quality"));
+        q_lbl.set_css_classes(&["text-secondary"]);
+        q_lbl.set_hexpand(true);
+        q_lbl.set_xalign(0.0);
+        q_row.append(&q_lbl);
+        for q in Mp3Quality::ALL {
+            let btn = gtk4::Button::with_label(q.label());
+            btn.set_css_classes(if cfg.mp3_quality == q {
+                &["ctrl-btn", "active"]
+            } else {
+                &["ctrl-btn"]
+            });
+            make_clickable(&btn, &format!("Set default MP3 quality to {}", q.label()));
+            let b_q = bridge.clone();
+            btn.connect_clicked(move |_| (b_q.send)(UiCommand::SetMp3Quality(q)));
+            q_row.append(&btn);
+        }
+        mp3_card.append(&q_row);
+
+        let auto_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let auto_lbl = gtk4::Label::new(Some("Auto-Add Saved MP3s to Local Library"));
+        auto_lbl.set_css_classes(&["text-secondary"]);
+        auto_lbl.set_hexpand(true);
+        auto_lbl.set_xalign(0.0);
+        let auto_sw = gtk4::Switch::new();
+        auto_sw.add_css_class("pulse-switch");
+        auto_sw.set_active(cfg.mp3_auto_add_to_library);
+        let b_au = bridge.clone();
+        auto_sw.connect_state_set(move |_, v| {
+            (b_au.send)(UiCommand::SetMp3AutoAddToLibrary(v));
+            glib::Propagation::Proceed
+        });
+        auto_row.append(&auto_lbl);
+        auto_row.append(&auto_sw);
+        mp3_card.append(&auto_row);
+
+        let strip_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let strip_lbl = gtk4::Label::new(Some("Cut Sponsor & Non-Music Segments in Saved MP3s"));
+        strip_lbl.set_css_classes(&["text-secondary"]);
+        strip_lbl.set_hexpand(true);
+        strip_lbl.set_xalign(0.0);
+        let strip_sw = gtk4::Switch::new();
+        strip_sw.add_css_class("pulse-switch");
+        strip_sw.set_active(cfg.mp3_strip_sponsors);
+        let b_st = bridge.clone();
+        strip_sw.connect_state_set(move |_, v| {
+            (b_st.send)(UiCommand::SetMp3StripSponsors(v));
+            glib::Propagation::Proceed
+        });
+        strip_row.append(&strip_lbl);
+        strip_row.append(&strip_sw);
+        mp3_card.append(&strip_row);
+
+        let ad_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let ad_col = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        ad_col.set_hexpand(true);
+        let ad_lbl = gtk4::Label::new(Some("Ad-Free Shield & SponsorBlock Auto-Skip"));
+        ad_lbl.set_css_classes(&["heading-md"]);
+        ad_lbl.set_xalign(0.0);
+        let ad_sub = gtk4::Label::new(Some(
+            "Blocks YouTube/SoundCloud ad items, skips SponsorBlock sponsor/non-music segments during playback, and mutes Spotify ad breaks.",
+        ));
+        ad_sub.set_css_classes(&["text-muted"]);
+        ad_sub.set_wrap(true);
+        ad_sub.set_xalign(0.0);
+        ad_col.append(&ad_lbl);
+        ad_col.append(&ad_sub);
+        let ad_sw = gtk4::Switch::new();
+        ad_sw.add_css_class("pulse-switch");
+        ad_sw.set_active(cfg.ad_block_enabled);
+        let b_ad = bridge.clone();
+        ad_sw.connect_state_set(move |_, v| {
+            (b_ad.send)(UiCommand::SetAdBlockEnabled(v));
+            glib::Propagation::Proceed
+        });
+        ad_row.append(&ad_col);
+        ad_row.append(&ad_sw);
+        mp3_card.append(&ad_row);
+
+        self.body_box.append(&mp3_card);
     }
 
     fn build_account_tab(&self, bridge: &UiBridge) {
@@ -685,6 +931,11 @@ impl SettingsModalController {
                 "Restore Last Track & Queue on Launch",
                 cfg.resume_session_on_startup,
                 Box::new(UiCommand::SetResumeOnStartup),
+            ),
+            (
+                "Ad-Free Shield & SponsorBlock Auto-Skip",
+                cfg.ad_block_enabled,
+                Box::new(UiCommand::SetAdBlockEnabled),
             ),
         ] {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);

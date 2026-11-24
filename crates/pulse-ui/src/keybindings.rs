@@ -33,6 +33,34 @@ pub fn install_key_controller(window: &gtk4::ApplicationWindow, bridge: &UiBridg
             (b.redraw)(DirtyFlags::SETTINGS);
             return glib::Propagation::Stop;
         }
+        if is_ctrl && (key == Key::d || key == Key::D) {
+            let yt_track = {
+                let s = b.store.borrow();
+                s.view
+                    .player_state
+                    .active_track
+                    .as_ref()
+                    .map(|t| t.summary.clone())
+                    .filter(|t| t.source == pulse_model::MediaSource::YouTube)
+                    .or_else(|| {
+                        let idx = s.selected_track_index?;
+                        s.visible_tracks()
+                            .into_iter()
+                            .find(|(i, _)| *i == idx)
+                            .map(|(_, tr)| tr)
+                            .filter(|t| t.source == pulse_model::MediaSource::YouTube)
+                    })
+            };
+            if let Some(track) = yt_track {
+                (b.send)(UiCommand::SaveYouTubeMp3 {
+                    track,
+                    dest_path: None,
+                    quality: None,
+                    strip_sponsors: None,
+                });
+            }
+            return glib::Propagation::Stop;
+        }
         if key == Key::Escape {
             let mut s = b.store.borrow_mut();
             if s.settings_open {

@@ -1,4 +1,4 @@
-//! Native GTK4 + Cairo UI for Pulse multi-source audio player.
+//! Native GTK4 + Cairo UI for Aplayer multi-source audio player.
 
 pub use bytes;
 

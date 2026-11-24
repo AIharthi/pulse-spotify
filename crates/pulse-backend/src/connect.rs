@@ -542,7 +542,7 @@ pub fn cmd_play_context(
             "url": format!("context://{context_uri}"),
         },
         "play_origin": {
-            "feature_identifier": "pulse-spotify"
+            "feature_identifier": "aplayer"
         },
         "options": options,
     })
@@ -583,7 +583,7 @@ pub fn cmd_play_tracks(
             }]
         },
         "play_origin": {
-            "feature_identifier": "pulse-spotify"
+            "feature_identifier": "aplayer"
         },
         "options": options,
     })

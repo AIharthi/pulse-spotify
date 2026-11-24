@@ -1,10 +1,12 @@
-# Pulse
+# Aplayer
 
-Pulse is a native Linux desktop music player and audio studio built in Rust (`GTK4` + `Cairo`) that brings **Local Music**, **Spotify**, **YouTube**, and **SoundCloud** together in one unified workspace.
+Aplayer is a native Linux desktop music player and audio studio built in Rust (`GTK4` + `Cairo`) that brings **Local Music**, **Spotify**, **YouTube**, and **SoundCloud** together in one unified workspace without ads.
 
-## Sources & Playback
+## Sources, Ad-Free Playback & MP3 Export
 
 - **Local Music**: Recursive incremental indexing (`lofty` tags + embedded artwork + `.lrc` / embedded lyrics + `ffprobe` fallback) across `.flac`, `.mp3`, `.ogg`, `.opus`, `.m4a`, `.aac`, `.wav`, `.alac`, `.wv`, `.ape`, and `.aiff`. Supports drag-and-drop folders/files and CLI paths.
+- **Ad-Free Shield & SponsorBlock**: Filters YouTube ad renderers and SoundCloud promotional entries, automatically skips SponsorBlock `sponsor`, `selfpromo`, `interaction`, and `music_offtopic` segments on YouTube playback (via privacy-preserving 4-char SHA-256 prefix lookup), and mutes/skips Spotify ad intervals when active.
+- **YouTube to MP3 Export (`Ctrl+D` or Save MP3 popover)**: Export any YouTube track to ID3v2-tagged `.mp3` with embedded cover art, selectable encoding profile (`320 kbps`, `V0 VBR`, `192 kbps`, `128 kbps`), optional SponsorBlock segment trimming (`ffmpeg` `aselect`), Quick Save to your configured downloads folder or `Save MP3 As...`, and automatic indexing into Local Music.
 - **YouTube**: Account-free InnerTube search, `VL` playlist expansion, video URL resolution, and full-length ranged chunk staging (`ANDROID_VR` + `IOS` fallback).
 - **SoundCloud**: Account-free track/set search, permalink resolution (`/resolve`), and full stream playback.
 - **Spotify**: Optional Spotify OAuth + Web API sync + Zeroconf Spotify Connect discovery and playback transfer (`spotatui-librespot-*` via PulseAudio / ALSA).
@@ -23,6 +25,7 @@ Pulse is a native Linux desktop music player and audio studio built in Rust (`GT
 
 - `Space`: Play / Pause
 - `/`: Filter active list; `Ctrl+K`: Multi-source Search or resolve URL / file path
+- `Ctrl+D`: Save active or selected YouTube track as MP3
 - `[` / `]`: Previous / Next track
 - `Left` / `Right` (`Shift`): Seek `-/+5s` (`-/+15s`)
 - `-` / `=`: Decrease / increase volume
@@ -37,7 +40,7 @@ Pulse is a native Linux desktop music player and audio studio built in Rust (`GT
 
 ## Build, Verify & Install
 
-Prerequisites on Linux: Rust (`1.93+`), `gtk4`, `ffmpeg`, `ffprobe`, `libpulse`, and `alsa-lib`.
+Prerequisites on Linux: Rust (`1.93+`), `gtk4`, `ffmpeg`, `ffprobe`, `lame` (optional for fast CLI MP3 encoding, otherwise `ffmpeg` `libmp3lame`), `libpulse`, and `alsa-lib`.
 
 ```bash
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -48,5 +51,5 @@ cargo build --release --locked
 Install the release binary locally:
 
 ```bash
-install -Dm755 target/release/pulse-spotify ~/.local/bin/pulse-spotify
+install -Dm755 target/release/aplayer ~/.local/bin/aplayer
 ```

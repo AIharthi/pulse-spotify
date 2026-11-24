@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, Request, header};
-use pulse_model::{ImageRef, MediaSource, TrackSummary};
+use pulse_model::{ImageRef, MediaSource, SponsorSegment, TrackSummary};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use spotatui_librespot_core::http_client::HttpClient;
 
 use crate::config::{AppPaths, write_atomic};
@@ -124,6 +125,22 @@ fn clean_yt_channel(owner: &str) -> String {
 }
 
 fn track_from_video_renderer(vr: &Value, liked_uris: &HashSet<String>) -> Option<TrackSummary> {
+    if vr.get("promotedSparklesWebRenderer").is_some()
+        || vr.get("adBadgeRenderer").is_some()
+        || vr
+            .get("badges")
+            .and_then(|b| b.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|x| {
+                    let s = x.to_string();
+                    s.contains("adBadgeRenderer")
+                        || s.contains("\"Ad\"")
+                        || s.contains("Sponsored")
+                })
+            })
+    {
+        return None;
+    }
     let vid = vr.get("videoId")?.as_str()?.trim();
     if vid.len() != 11 {
         return None;
@@ -498,6 +515,13 @@ pub async fn download_youtube_audio_bytes(
         {
             continue;
         }
+        if let Some(resp_vid) = player_json
+            .pointer("/videoDetails/videoId")
+            .and_then(|v| v.as_str())
+            && resp_vid != video_id
+        {
+            continue;
+        }
         let Some(formats) = player_json
             .pointer("/streamingData/adaptiveFormats")
             .and_then(|f| f.as_array())
@@ -616,4 +640,158 @@ pub async fn ensure_youtube_audio_cached(
     write_atomic(&target, &bytes, false)
         .map_err(|e| format!("failed to cache YouTube audio: {e}"))?;
     Ok((target, label))
+}
+
+/// Fetches the YouTube thumbnail JPEG bytes best-effort for ID3 cover embedding.
+pub async fn fetch_youtube_cover_jpeg(http: &HttpClient, video_id: &str) -> Option<Vec<u8>> {
+    let url = format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&url)
+        .header(header::USER_AGENT, "Aplayer/0.3")
+        .body(Bytes::new())
+        .ok()?;
+    let bytes = tokio::time::timeout(Duration::from_secs(6), http.request_body(req))
+        .await
+        .ok()?
+        .ok()?;
+    if bytes.len() >= 128 {
+        Some(bytes.to_vec())
+    } else {
+        None
+    }
+}
+
+/// Parses and merges overlapping/adjacent SponsorBlock skip intervals for `video_id`.
+pub fn parse_sponsorblock_payload(raw: &[u8], video_id: &str) -> Vec<SponsorSegment> {
+    let Ok(Value::Array(videos)) = serde_json::from_slice::<Value>(raw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in videos {
+        if entry.get("videoID").and_then(|v| v.as_str()) != Some(video_id) {
+            continue;
+        }
+        let Some(segs) = entry.get("segments").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for seg in segs {
+            let action = seg
+                .get("actionType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("skip");
+            if action != "skip" {
+                continue;
+            }
+            if seg.get("votes").and_then(|v| v.as_i64()).unwrap_or(0) < 0 {
+                continue;
+            }
+            let Some(pair) = seg.get("segment").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            if pair.len() < 2 {
+                continue;
+            }
+            let Some(start_s) = pair[0].as_f64() else {
+                continue;
+            };
+            let Some(end_s) = pair[1].as_f64() else {
+                continue;
+            };
+            if !(start_s.is_finite() && end_s.is_finite()) || end_s <= start_s + 0.5 {
+                continue;
+            }
+            let start_ms = (start_s.max(0.0) * 1000.0)
+                .min(u32::MAX as f64)
+                .round() as u32;
+            let end_ms = (end_s.max(0.0) * 1000.0)
+                .min(u32::MAX as f64)
+                .round() as u32;
+            if end_ms > start_ms.saturating_add(500) {
+                let category = seg
+                    .get("category")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("sponsor")
+                    .to_string();
+                out.push(SponsorSegment {
+                    start_ms,
+                    end_ms,
+                    category,
+                });
+            }
+        }
+    }
+    out.sort_by_key(|s| (s.start_ms, s.end_ms));
+    let mut merged: Vec<SponsorSegment> = Vec::with_capacity(out.len());
+    for seg in out {
+        if let Some(last) = merged.last_mut()
+            && seg.start_ms <= last.end_ms.saturating_add(250)
+        {
+            if seg.end_ms > last.end_ms {
+                last.end_ms = seg.end_ms;
+            }
+            continue;
+        }
+        merged.push(seg);
+    }
+    merged
+}
+
+/// Queries SponsorBlock using k-anonymous 4-char SHA-256 prefix lookup (`sponsor.ajay.app`).
+pub async fn fetch_youtube_skip_segments(
+    http: &HttpClient,
+    video_id: &str,
+) -> Vec<SponsorSegment> {
+    if video_id.len() != 11 {
+        return Vec::new();
+    }
+    let digest = Sha256::digest(video_id.as_bytes());
+    let prefix = format!("{:02x}{:02x}", digest[0], digest[1]);
+    let url = format!(
+        "https://sponsor.ajay.app/api/skipSegments/{prefix}?categories=%5B%22sponsor%22,%22selfpromo%22,%22interaction%22,%22music_offtopic%22%5D"
+    );
+    let Ok(req) = Request::builder()
+        .method(Method::GET)
+        .uri(&url)
+        .header(header::USER_AGENT, "Aplayer/0.3")
+        .body(Bytes::new())
+    else {
+        return Vec::new();
+    };
+    let Ok(Ok(body)) = tokio::time::timeout(Duration::from_secs(5), http.request_body(req)).await
+    else {
+        return Vec::new();
+    };
+    parse_sponsorblock_payload(&body, video_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_merge_sponsorblock_payload() {
+        let json = br#"[
+            {
+                "videoID": "otherVideo1",
+                "segments": [{"category": "sponsor", "actionType": "skip", "votes": 5, "segment": [0.0, 20.0]}]
+            },
+            {
+                "videoID": "dQw4w9WgXcQ",
+                "segments": [
+                    {"category": "music_offtopic", "actionType": "skip", "votes": 3, "segment": [0.0, 12.2]},
+                    {"category": "sponsor", "actionType": "skip", "votes": 10, "segment": [12.3, 25.5]},
+                    {"category": "selfpromo", "actionType": "skip", "votes": -2, "segment": [30.0, 40.0]},
+                    {"category": "poi_highlight", "actionType": "poi", "votes": 5, "segment": [45.0, 45.0]},
+                    {"category": "outro", "actionType": "skip", "votes": 2, "segment": [180.0, 195.0]}
+                ]
+            }
+        ]"#;
+        let segs = parse_sponsorblock_payload(json, "dQw4w9WgXcQ");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].start_ms, 0);
+        assert_eq!(segs[0].end_ms, 25_500);
+        assert_eq!(segs[1].start_ms, 180_000);
+        assert_eq!(segs[1].end_ms, 195_000);
+    }
 }

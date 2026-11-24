@@ -415,6 +415,46 @@ impl RepeatMode {
     }
 }
 
+/// Target MP3 encoding profile for saving YouTube audio locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Mp3Quality {
+    #[default]
+    Cbr320,
+    VbrV0,
+    Cbr192,
+    Cbr128,
+}
+
+impl Mp3Quality {
+    pub const ALL: [Self; 4] = [Self::Cbr320, Self::VbrV0, Self::Cbr192, Self::Cbr128];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cbr320 => "320 kbps",
+            Self::VbrV0 => "V0 VBR",
+            Self::Cbr192 => "192 kbps",
+            Self::Cbr128 => "128 kbps",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Cbr320 => "320k",
+            Self::VbrV0 => "V0",
+            Self::Cbr192 => "192k",
+            Self::Cbr128 => "128k",
+        }
+    }
+}
+
+/// Timed non-music or sponsor interval returned by SponsorBlock for YouTube tracks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SponsorSegment {
+    pub start_ms: u32,
+    pub end_ms: u32,
+    pub category: String,
+}
+
 /// Active library browsing scope in the navigation rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LibraryScope {
@@ -498,13 +538,18 @@ pub struct AppConfig {
     pub playback_speed: PlaybackSpeed,
     pub crossfade_ms: u16,
     pub resume_session_on_startup: bool,
+    pub ad_block_enabled: bool,
+    pub mp3_download_dir: String,
+    pub mp3_quality: Mp3Quality,
+    pub mp3_auto_add_to_library: bool,
+    pub mp3_strip_sponsors: bool,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             custom_client_id: None,
-            device_name: String::from("Pulse"),
+            device_name: String::from("Aplayer"),
             zeroconf_enabled: true,
             audio_device: None,
             stream_quality: StreamQuality::Kbps320,
@@ -524,6 +569,11 @@ impl Default for AppConfig {
             playback_speed: PlaybackSpeed::default(),
             crossfade_ms: 0,
             resume_session_on_startup: true,
+            ad_block_enabled: true,
+            mp3_download_dir: String::new(),
+            mp3_quality: Mp3Quality::Cbr320,
+            mp3_auto_add_to_library: true,
+            mp3_strip_sponsors: true,
         }
     }
 }
@@ -998,6 +1048,7 @@ pub struct AppViewState {
     pub lyrics: LyricsState,
     pub insights: ListeningStatsSnapshot,
     pub right_drawer: RightDrawerTab,
+    pub downloads_in_flight: BTreeSet<String>,
     pub telemetry: TelemetrySnapshot,
     pub notice_banner: Option<String>,
 }
@@ -1143,6 +1194,17 @@ pub enum UiCommand {
     SetCrossfadeMs(u16),
     SetResumeOnStartup(bool),
     SetMode(AppMode),
+    SetAdBlockEnabled(bool),
+    SetMp3DownloadDir(String),
+    SetMp3Quality(Mp3Quality),
+    SetMp3AutoAddToLibrary(bool),
+    SetMp3StripSponsors(bool),
+    SaveYouTubeMp3 {
+        track: TrackSummary,
+        dest_path: Option<String>,
+        quality: Option<Mp3Quality>,
+        strip_sponsors: Option<bool>,
+    },
 }
 
 /// Asynchronous updates pushed from `pulse-backend` to the UI.
@@ -1200,6 +1262,15 @@ pub enum BackendEvent {
         is_liked: bool,
     },
     TelemetryUpdated(TelemetrySnapshot),
+    Mp3DownloadStarted {
+        uri: String,
+        title: String,
+    },
+    Mp3DownloadFinished {
+        uri: String,
+        saved_path: Option<String>,
+        error: Option<String>,
+    },
     Notice(Option<String>),
     Error(String),
 }
@@ -1267,5 +1338,21 @@ mod tests {
             MediaSource::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC"),
             MediaSource::Spotify
         );
+    }
+
+    #[test]
+    fn mp3_quality_and_aplayer_config_defaults_are_valid() {
+        assert_eq!(Mp3Quality::ALL.len(), 4);
+        assert_eq!(Mp3Quality::Cbr320.label(), "320 kbps");
+        assert_eq!(Mp3Quality::VbrV0.short_label(), "V0");
+        assert_eq!(Mp3Quality::Cbr192.label(), "192 kbps");
+        assert_eq!(Mp3Quality::Cbr128.short_label(), "128k");
+
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.device_name, "Aplayer");
+        assert!(cfg.ad_block_enabled);
+        assert_eq!(cfg.mp3_quality, Mp3Quality::Cbr320);
+        assert!(cfg.mp3_auto_add_to_library);
+        assert!(cfg.mp3_strip_sponsors);
     }
 }

@@ -95,8 +95,8 @@ pub fn run_self_test(ctx: SelfTestContext) {
                 total_listen_secs: 5_420,
                 total_plays: 24,
                 source_secs: [2_800, 1_120, 980, 520],
-                top_tracks: vec![(hero_track, 6)],
-                top_artists: vec![("Pulse Analog Quartet".to_string(), 6)],
+                top_tracks: vec![(hero_track.clone(), 6)],
+                top_artists: vec![("Aplayer Studio Quartet".to_string(), 6)],
             };
             s.view.right_drawer = RightDrawerTab::Queue;
             s.recompute_tokens();
@@ -105,7 +105,9 @@ pub fn run_self_test(ctx: SelfTestContext) {
         (bridge.redraw)(DirtyFlags::ALL);
         capture_step_async(&window, &out_dir, "01-deck-home-dark.png", &mut report).await;
 
-        // 2. Click real Search button + inject multi-source SearchResults
+        // 2. Click real Shield & Search buttons + inject multi-source SearchResults & showcase YouTube deck Save MP3 button
+        header.shield_btn.emit_clicked();
+        header.shield_btn.emit_clicked();
         header.set_omnibox_text("night drive");
         header.search_btn.emit_clicked();
         let search_res = SearchResults {
@@ -118,12 +120,28 @@ pub fn run_self_test(ctx: SelfTestContext) {
             tracks: preview_tracks.clone(),
             tracks_only_fallback: false,
         };
+        {
+            let mut s = bridge.store.borrow_mut();
+            s.view.player_state.active_source = MediaSource::YouTube;
+            s.view.player_state.audio_badge = "YT OPUS".to_string();
+            s.view.player_state.active_track = Some(TrackDetail {
+                summary: preview_tracks[2].clone(),
+                track_number: None,
+                disc_total_tracks: None,
+                release_year: None,
+                explicit: false,
+            });
+        }
         let fl = bridge
             .store
             .borrow_mut()
             .apply_backend_event(BackendEvent::SearchResultsLoaded(search_res));
-        (bridge.redraw)(fl);
-        report.push("emit_clicked:search_btn -> multi-source search loaded".to_string());
+        (bridge.redraw)(fl | DirtyFlags::PLAYER_META);
+        assert!(
+            deck.save_mp3_btn.is_visible(),
+            "YouTube deck Save MP3 button should be visible when YouTube track is active"
+        );
+        report.push("emit_clicked:shield_btn + search_btn -> multi-source search + YouTube MP3 actions loaded".to_string());
         capture_step_async(
             &window,
             &out_dir,
@@ -131,6 +149,20 @@ pub fn run_self_test(ctx: SelfTestContext) {
             &mut report,
         )
         .await;
+
+        // Restore local studio track for remaining Drawer/Stage/Light showcase captures
+        {
+            let mut s = bridge.store.borrow_mut();
+            s.view.player_state.active_source = MediaSource::Local;
+            s.view.player_state.audio_badge = "FLAC 44.1kHz".to_string();
+            s.view.player_state.active_track = Some(TrackDetail {
+                summary: hero_track,
+                track_number: Some(1),
+                disc_total_tracks: Some(12),
+                release_year: Some(2024),
+                explicit: false,
+            });
+        }
 
         // 3. Click real EQ & FX drawer tab button & configure Electronic preset
         if let Some((_, eq_tab_btn)) = drawer
@@ -332,7 +364,7 @@ fn sample_multisource_tracks() -> Vec<TrackSummary> {
         TrackSummary {
             uri: Arc::from("local:/Music/night-drive.flac"),
             title: "Midnight Telemetry (Master)".to_string(),
-            artist: Arc::from("Pulse Analog Quartet"),
+            artist: Arc::from("Aplayer Studio Quartet"),
             artist_uri: None,
             album: Arc::from("Glass & Copper"),
             album_uri: None,

@@ -150,11 +150,11 @@ impl LocalRootInterface for PulseMprisImp {
     }
 
     async fn identity(&self) -> fdo::Result<String> {
-        Ok("Pulse".to_string())
+        Ok("Aplayer".to_string())
     }
 
     async fn desktop_entry(&self) -> fdo::Result<String> {
-        Ok("pulse-spotify".to_string())
+        Ok("aplayer".to_string())
     }
 
     async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
@@ -401,7 +401,7 @@ impl MprisController {
             state: Rc::clone(&state),
             cmd_tx,
         };
-        let server = LocalServer::new("pulse_spotify", imp)
+        let server = LocalServer::new("aplayer", imp)
             .await
             .map_err(|e| format!("failed to register MPRIS2 D-Bus server: {e}"))?;
         let server = Rc::new(server);

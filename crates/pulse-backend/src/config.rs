@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use spotatui_librespot_core::cache::Cache;
 
-const APP_DIR_NAME: &str = "pulse-spotify";
+const APP_DIR_NAME: &str = "aplayer";
+const LEGACY_APP_DIR_NAME: &str = "pulse-spotify";
 
-/// Resolved XDG filesystem paths used by the Pulse Spotify backend.
+/// Resolved XDG filesystem paths used by the Aplayer backend.
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -28,11 +29,13 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
-    /// Resolves standard XDG directories (`$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME`).
+    /// Resolves standard XDG directories (`$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME`),
+    /// migrating existing legacy `pulse-spotify` config/credentials into `aplayer` once if needed.
     pub fn from_xdg() -> Self {
         let config_base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         let data_base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
         let cache_base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
+        migrate_legacy_xdg_if_needed(&config_base, &data_base);
         Self {
             config_dir: config_base.join(APP_DIR_NAME),
             data_dir: data_base.join(APP_DIR_NAME),
@@ -132,7 +135,64 @@ impl RecentHistory {
     }
 }
 
-/// Loads [`AppConfig`] from `$XDG_CONFIG_HOME/pulse-spotify/config.json`, falling back to defaults.
+fn migrate_legacy_xdg_if_needed(config_base: &Path, data_base: &Path) {
+    let legacy_cfg_file = config_base.join(LEGACY_APP_DIR_NAME).join("config.json");
+    let new_cfg_dir = config_base.join(APP_DIR_NAME);
+    let new_cfg_file = new_cfg_dir.join("config.json");
+    if !new_cfg_file.exists() && legacy_cfg_file.is_file() {
+        let _ = fs::create_dir_all(&new_cfg_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&new_cfg_dir, fs::Permissions::from_mode(0o700));
+        }
+        let _ = fs::copy(&legacy_cfg_file, &new_cfg_file);
+    }
+
+    let legacy_data_dir = data_base.join(LEGACY_APP_DIR_NAME);
+    let new_data_dir = data_base.join(APP_DIR_NAME);
+    let should_migrate_data = legacy_data_dir.is_dir()
+        && (!new_data_dir.join("device_id").exists() || !new_data_dir.join("credentials.json").exists());
+    if should_migrate_data {
+        let _ = fs::create_dir_all(&new_data_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&new_data_dir, fs::Permissions::from_mode(0o700));
+        }
+        const DATA_FILES: [(&str, bool); 10] = [
+            ("credentials.json", true),
+            ("web_api_token.json", true),
+            ("auth_meta.json", true),
+            ("device_id", false),
+            ("recent.json", false),
+            ("likes.json", false),
+            ("playlists.json", false),
+            ("session_state.json", false),
+            ("stats.json", false),
+            ("volume", false),
+        ];
+        for (name, secret) in DATA_FILES {
+            let src = legacy_data_dir.join(name);
+            let dst = new_data_dir.join(name);
+            if src.is_file() && !dst.exists() && fs::copy(&src, &dst).is_ok() && secret {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+    }
+}
+
+/// Returns whether `candidate` is already covered by any directory in `dirs` (exact match or ancestor).
+pub fn is_dir_covered_by_roots(dirs: &[String], candidate: &Path) -> bool {
+    dirs.iter()
+        .any(|d| candidate == Path::new(d) || candidate.starts_with(Path::new(d)))
+}
+
+/// Loads [`AppConfig`] from `$XDG_CONFIG_HOME/aplayer/config.json`, falling back to defaults.
 pub fn load_config(paths: &AppPaths) -> AppConfig {
     let mut cfg = match fs::read(&paths.config_file) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -147,11 +207,26 @@ pub fn load_config(paths: &AppPaths) -> AppConfig {
         },
         Err(_) => AppConfig::default(),
     };
+    if matches!(cfg.device_name.trim(), "" | "Pulse" | "pulse-spotify") {
+        cfg.device_name = String::from("Aplayer");
+    }
+    if cfg.mp3_download_dir.trim().is_empty() {
+        let base_dir = dirs::audio_dir()
+            .or_else(dirs::download_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        cfg.mp3_download_dir = base_dir.join("Aplayer").to_string_lossy().to_string();
+    }
     if cfg.local_music_dirs.is_empty()
         && let Some(music_dir) = dirs::audio_dir()
         && music_dir.is_dir()
     {
         cfg.local_music_dirs.push(music_dir.to_string_lossy().to_string());
+    }
+    if cfg.mp3_auto_add_to_library
+        && Path::new(&cfg.mp3_download_dir).is_dir()
+        && !is_dir_covered_by_roots(&cfg.local_music_dirs, Path::new(&cfg.mp3_download_dir))
+    {
+        cfg.local_music_dirs.push(cfg.mp3_download_dir.clone());
     }
     cfg
 }

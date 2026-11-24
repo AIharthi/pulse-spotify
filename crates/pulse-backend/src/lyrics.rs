@@ -123,7 +123,7 @@ async fn http_get_json(http: &HttpClient, url: &str) -> Option<Value> {
     let req = Request::builder()
         .method(Method::GET)
         .uri(url)
-        .header(header::USER_AGENT, "PulsePlayer/0.2.0 (https://github.com/AIharthi/pulse-spotify)")
+        .header(header::USER_AGENT, "Aplayer/0.3.0 (https://github.com/AIharthi/pulse-spotify)")
         .body(Bytes::new())
         .ok()?;
     let raw = tokio::time::timeout(Duration::from_secs(10), http.request_body(req))

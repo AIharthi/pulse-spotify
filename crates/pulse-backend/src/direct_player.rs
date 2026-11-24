@@ -136,10 +136,10 @@ impl DirectPulseSink {
             };
             let simple = Simple::new(
                 None,
-                "Pulse",
+                "Aplayer",
                 pulse::stream::Direction::Playback,
                 self.device.as_deref(),
-                "Pulse Multi-Source Audio",
+                "Aplayer Multi-Source Audio",
                 &spec,
                 None,
                 Some(&attr),

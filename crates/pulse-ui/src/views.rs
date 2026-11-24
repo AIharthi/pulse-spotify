@@ -15,7 +15,10 @@ use pulse_model::{
 };
 
 use crate::SpectrumReadFn;
-use crate::dialogs::{open_add_to_playlist_popover, populate_devices_popover, populate_sleep_popover};
+use crate::dialogs::{
+    open_add_to_playlist_popover, open_save_mp3_popover, populate_devices_popover,
+    populate_sleep_popover,
+};
 use crate::drawers::LyricsPanelWidget;
 use crate::icons_gtk::{make_clickable, vector_icon_button};
 use crate::state::{
@@ -38,6 +41,8 @@ struct RowWidgets {
     sub_lbl: gtk4::Label,
     source_chip: gtk4::Label,
     dur_lbl: gtk4::Label,
+    dl_btn: gtk4::Button,
+    dl_img: gtk4::Image,
     like_img: gtk4::Image,
     bound: Rc<RefCell<Option<TrackRowItem>>>,
     bound_cover_id: Rc<RefCell<String>>,
@@ -63,6 +68,8 @@ pub struct TopHeaderWidget {
     dev_btn: gtk4::MenuButton,
     dev_lbl: gtk4::Label,
     dev_img: gtk4::Image,
+    pub shield_btn: gtk4::Button,
+    shield_img: gtk4::Image,
     pub theme_btn: gtk4::Button,
     theme_img: gtk4::Image,
     settings_img: gtk4::Image,
@@ -263,6 +270,24 @@ impl TopHeaderWidget {
         dev_btn.set_popover(Some(&dev_pop));
         root.append(&dev_btn);
 
+        // Ad-Free Shield & SponsorBlock toggle
+        let (shield_btn, shield_img) = vector_icon_button(
+            &bridge.icons,
+            "shield_check",
+            icons::SHIELD_CHECK,
+            &fg_sec,
+            16,
+            "Ad-Free Shield & SponsorBlock (click to toggle)",
+            &["ghost-btn"],
+        );
+        let b_shld = bridge.clone();
+        shield_btn.connect_clicked(move |_| {
+            let next = !b_shld.store.borrow().view.config.ad_block_enabled;
+            b_shld.record_action(format!("header:adblock:{next}"));
+            (b_shld.send)(UiCommand::SetAdBlockEnabled(next));
+        });
+        root.append(&shield_btn);
+
         // Dark / Light quick toggle
         let (theme_btn, theme_img) = vector_icon_button(
             &bridge.icons,
@@ -353,6 +378,8 @@ impl TopHeaderWidget {
             dev_btn,
             dev_lbl,
             dev_img,
+            shield_btn,
+            shield_img,
             theme_btn,
             theme_img,
             settings_img,
@@ -361,7 +388,19 @@ impl TopHeaderWidget {
     }
 
     pub fn sync(&self, bridge: &UiBridge, flags: DirtyFlags) {
-        let (mode, can_back, can_fwd, sleep, dev_name, is_light, notice, has_err, width, tokens) = {
+        let (
+            mode,
+            can_back,
+            can_fwd,
+            sleep,
+            dev_name,
+            ad_block,
+            is_light,
+            notice,
+            has_err,
+            width,
+            tokens,
+        ) = {
             let s = bridge.store.borrow();
             let cv = &s.view.crate_view;
             let can_b = cv.history_index > 0;
@@ -380,6 +419,7 @@ impl TopHeaderWidget {
                 can_f,
                 s.view.player_state.sleep_timer,
                 active_dev,
+                s.view.config.ad_block_enabled,
                 s.tokens.is_light,
                 s.view.notice_banner.clone(),
                 cv.error.is_some(),
@@ -387,6 +427,21 @@ impl TopHeaderWidget {
                 s.tokens.clone(),
             )
         };
+
+        let acc_hex = AdaptiveThemeTokens::hex(tokens.accent);
+        let fg_muted = AdaptiveThemeTokens::hex(tokens.fg_muted);
+        bridge.icons.apply_to_image(
+            &self.shield_img,
+            "shield_check",
+            icons::SHIELD_CHECK,
+            if ad_block { &acc_hex } else { &fg_muted },
+            16,
+        );
+        self.shield_btn.set_tooltip_text(Some(if ad_block {
+            "Ad-Free Shield & SponsorBlock: Active (click to toggle)"
+        } else {
+            "Ad-Free Shield & SponsorBlock: Off (click to toggle)"
+        }));
 
         self.back_btn.set_sensitive(can_back);
         self.fwd_btn.set_sensitive(can_fwd);
@@ -1463,7 +1518,7 @@ impl CenterCanvasWidget {
                 if local_count == 0 {
                     (
                         "No local audio folders added",
-                        "Add a folder containing FLAC, MP3, Ogg, Opus, M4A, WAV, or ALAC files, or drag and drop audio files into Pulse.",
+                        "Add a folder containing FLAC, MP3, Ogg, Opus, M4A, WAV, or ALAC files, or drag and drop audio files into Aplayer.",
                         Some("Add Music Folder"),
                     )
                 } else {
@@ -1909,6 +1964,28 @@ fn build_track_row_widgets(bridge: &UiBridge) -> Rc<RowWidgets> {
         }
     });
 
+    let (dl_btn, dl_img) = vector_icon_button(
+        &bridge.icons,
+        "download",
+        icons::DOWNLOAD,
+        &fg_sec,
+        15,
+        "Save YouTube track as MP3",
+        &["ghost-btn"],
+    );
+    dl_btn.set_visible(false);
+    let bound_dl = Rc::clone(&bound);
+    let b_dl = bridge.clone();
+    let dl_btn_ref = dl_btn.clone();
+    dl_btn.connect_clicked(move |_| {
+        if let Some(ref item) = *bound_dl.borrow()
+            && item.track.source == MediaSource::YouTube
+        {
+            b_dl.record_action(format!("row:save-mp3:{}", item.track.uri));
+            open_save_mp3_popover(&dl_btn_ref, &b_dl, item.track.clone());
+        }
+    });
+
     let add_pl_btn = gtk4::Button::new();
     let add_img = bridge.icons.make_image("plus", icons::PLUS, &fg_sec, 14);
     add_pl_btn.set_child(Some(&add_img));
@@ -1945,6 +2022,7 @@ fn build_track_row_widgets(bridge: &UiBridge) -> Rc<RowWidgets> {
     root.append(&play_area);
     root.append(&source_chip);
     root.append(&queue_btn);
+    root.append(&dl_btn);
     root.append(&add_pl_btn);
     root.append(&like_btn);
     root.append(&dur_lbl);
@@ -1958,6 +2036,8 @@ fn build_track_row_widgets(bridge: &UiBridge) -> Rc<RowWidgets> {
         sub_lbl,
         source_chip,
         dur_lbl,
+        dl_btn,
+        dl_img,
         like_img,
         bound,
         bound_cover_id,
@@ -1982,7 +2062,7 @@ fn bind_track_row(bridge: &UiBridge, w: &RowWidgets, item: &TrackRowItem) {
 
     w.dur_lbl.set_text(&format_duration_ms(item.track.duration_ms));
 
-    let (active_uri, selected_idx, tokens, loaded_cnt) = {
+    let (active_uri, selected_idx, tokens, loaded_cnt, dl_in_flight) = {
         let s = bridge.store.borrow();
         (
             s.view
@@ -1993,8 +2073,27 @@ fn bind_track_row(bridge: &UiBridge, w: &RowWidgets, item: &TrackRowItem) {
             s.selected_track_index,
             s.tokens.clone(),
             s.view.crate_view.loaded_tracks.loaded_count(),
+            s.view.downloads_in_flight.contains(item.track.uri.as_ref()),
         )
     };
+
+    let is_yt = item.track.source == MediaSource::YouTube;
+    w.dl_btn.set_visible(is_yt);
+    if is_yt {
+        let dl_hex = if dl_in_flight {
+            AdaptiveThemeTokens::hex(tokens.accent)
+        } else {
+            AdaptiveThemeTokens::hex(tokens.fg_secondary)
+        };
+        bridge
+            .icons
+            .apply_to_image(&w.dl_img, "download", icons::DOWNLOAD, &dl_hex, 15);
+        w.dl_btn.set_tooltip_text(Some(if dl_in_flight {
+            "Saving MP3..."
+        } else {
+            "Save YouTube track as MP3"
+        }));
+    }
 
     if active_uri.as_ref().is_some_and(|u| u == &item.track.uri) {
         w.root.add_css_class("is-playing");
@@ -2125,6 +2224,8 @@ pub struct PlaybackDeckWidget {
     source_chip: gtk4::Label,
     codec_lbl: gtk4::Label,
     like_img: gtk4::Image,
+    pub save_mp3_btn: gtk4::Button,
+    save_mp3_img: gtk4::Image,
     shuffle_btn: gtk4::Button,
     shuffle_img: gtk4::Image,
     prev_img: gtk4::Image,
@@ -2232,8 +2333,37 @@ impl PlaybackDeckWidget {
             }
         });
 
+        let (save_mp3_btn, save_mp3_img) = vector_icon_button(
+            &bridge.icons,
+            "download",
+            icons::DOWNLOAD,
+            &fg_sec,
+            16,
+            "Save active YouTube track as MP3 (Ctrl+D)",
+            &["ghost-btn"],
+        );
+        save_mp3_btn.set_visible(false);
+        let b_mp3 = bridge.clone();
+        let save_btn_ref = save_mp3_btn.clone();
+        save_mp3_btn.connect_clicked(move |_| {
+            if let Some(tr) = b_mp3
+                .store
+                .borrow()
+                .view
+                .player_state
+                .active_track
+                .as_ref()
+                .map(|t| t.summary.clone())
+                .filter(|t| t.source == MediaSource::YouTube)
+            {
+                b_mp3.record_action("deck:save-mp3-options");
+                open_save_mp3_popover(&save_btn_ref, &b_mp3, tr);
+            }
+        });
+
         left_box.append(&cover_btn);
         left_box.append(&meta);
+        left_box.append(&save_mp3_btn);
         left_box.append(&like_btn);
 
         // Center Transport & Scrubber Cluster
@@ -2469,6 +2599,8 @@ impl PlaybackDeckWidget {
             source_chip,
             codec_lbl,
             like_img,
+            save_mp3_btn,
+            save_mp3_img,
             shuffle_btn,
             shuffle_img,
             prev_img,
@@ -2497,8 +2629,14 @@ impl PlaybackDeckWidget {
     }
 
     pub fn sync(&self, bridge: &UiBridge, flags: DirtyFlags) {
-        let (ps, viz_mode, drawer_tab, width, scrubbing_ms, tokens, loaded_cnt) = {
+        let (ps, viz_mode, drawer_tab, width, scrubbing_ms, tokens, loaded_cnt, active_dl_busy) = {
             let s = bridge.store.borrow();
+            let busy = s
+                .view
+                .player_state
+                .active_track
+                .as_ref()
+                .is_some_and(|t| s.view.downloads_in_flight.contains(t.summary.uri.as_ref()));
             (
                 s.view.player_state.clone(),
                 s.view.config.visualizer_mode,
@@ -2507,6 +2645,7 @@ impl PlaybackDeckWidget {
                 s.scrubbing_pos_ms,
                 s.tokens.clone(),
                 s.view.crate_view.loaded_tracks.loaded_count(),
+                busy,
             )
         };
 
@@ -2584,6 +2723,12 @@ impl PlaybackDeckWidget {
             }
 
             if let Some(ref tr) = ps.active_track {
+                let is_yt = tr.summary.source == MediaSource::YouTube;
+                self.save_mp3_btn.set_visible(is_yt);
+                if is_yt {
+                    let fg_sec = AdaptiveThemeTokens::hex(tokens.fg_secondary);
+                    bridge.icons.apply_to_image(&self.save_mp3_img, "download", icons::DOWNLOAD, &fg_sec, 15);
+                }
                 self.title_lbl.set_text(&tr.summary.title);
                 self.artist_lbl.set_text(&tr.summary.artist);
                 for cls in ["source-local", "source-spotify", "source-youtube", "source-soundcloud"] {
@@ -2601,6 +2746,20 @@ impl PlaybackDeckWidget {
                 };
                 bridge.icons.apply_to_image(&self.like_img, lk, lsvg, lhex, 16);
 
+                let is_yt = tr.summary.source == MediaSource::YouTube;
+                self.save_mp3_btn.set_visible(is_yt);
+                if is_yt {
+                    let dl_hex = if active_dl_busy { &acc } else { &fg_sec };
+                    bridge
+                        .icons
+                        .apply_to_image(&self.save_mp3_img, "download", icons::DOWNLOAD, dl_hex, 16);
+                    self.save_mp3_btn.set_tooltip_text(Some(if active_dl_busy {
+                        "Saving MP3..."
+                    } else {
+                        "Save active YouTube track as MP3 (Ctrl+D)"
+                    }));
+                }
+
                 if let Some(ref cover) = tr.summary.cover {
                     let cid = cover.id.to_string();
                     if *self.last_cover_id.borrow() != cid {
@@ -2614,6 +2773,7 @@ impl PlaybackDeckWidget {
                     self.cover_fb.set_visible(true);
                 }
             } else {
+                self.save_mp3_btn.set_visible(false);
                 self.title_lbl.set_text("Ready to play");
                 self.artist_lbl.set_text("Drop files, paste a URL, or select any track");
                 self.codec_lbl.set_text(&ps.audio_badge);
@@ -2731,6 +2891,8 @@ pub struct StageViewWidget {
     viz: AudioVisualizerWidget,
     lyrics_panel: Rc<LyricsPanelWidget>,
     play_img: gtk4::Image,
+    save_mp3_btn: gtk4::Button,
+    save_mp3_img: gtk4::Image,
     scrub_scale: gtk4::Scale,
     suppress_scrub: Rc<Cell<bool>>,
     pos_lbl: gtk4::Label,
@@ -2907,9 +3069,38 @@ impl StageViewWidget {
         let b_nx = bridge.clone();
         next_btn.connect_clicked(move |_| (b_nx.send)(UiCommand::NextTrack));
 
+        let save_mp3_btn = gtk4::Button::new();
+        save_mp3_btn.set_css_classes(&["ctrl-btn"]);
+        let sm_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let save_mp3_img = bridge.icons.make_image("download", icons::DOWNLOAD, &fg_sec, 15);
+        let sm_lbl = gtk4::Label::new(Some("Save MP3"));
+        sm_box.append(&save_mp3_img);
+        sm_box.append(&sm_lbl);
+        save_mp3_btn.set_child(Some(&sm_box));
+        save_mp3_btn.set_visible(false);
+        make_clickable(&save_mp3_btn, "Save active YouTube track as MP3 (Ctrl+D)");
+        let b_st_mp3 = bridge.clone();
+        let smb_ref = save_mp3_btn.clone();
+        save_mp3_btn.connect_clicked(move |_| {
+            if let Some(tr) = b_st_mp3
+                .store
+                .borrow()
+                .view
+                .player_state
+                .active_track
+                .as_ref()
+                .map(|t| t.summary.clone())
+                .filter(|t| t.source == MediaSource::YouTube)
+            {
+                b_st_mp3.record_action("stage:save-mp3-options");
+                open_save_mp3_popover(&smb_ref, &b_st_mp3, tr);
+            }
+        });
+
         tr_row.append(&prev_btn);
         tr_row.append(&play_btn);
         tr_row.append(&next_btn);
+        tr_row.append(&save_mp3_btn);
 
         bottom.append(&scrub_row);
         bottom.append(&tr_row);
@@ -2927,6 +3118,8 @@ impl StageViewWidget {
             viz,
             lyrics_panel,
             play_img,
+            save_mp3_btn,
+            save_mp3_img,
             scrub_scale,
             suppress_scrub,
             pos_lbl,
@@ -2961,6 +3154,12 @@ impl StageViewWidget {
             bridge.icons.apply_to_image(&self.play_img, pk, ps_svg, &on_acc, 20);
 
             if let Some(ref tr) = ps.active_track {
+                let is_yt = tr.summary.source == MediaSource::YouTube;
+                self.save_mp3_btn.set_visible(is_yt);
+                if is_yt {
+                    let fg_sec = AdaptiveThemeTokens::hex(tokens.fg_secondary);
+                    bridge.icons.apply_to_image(&self.save_mp3_img, "download", icons::DOWNLOAD, &fg_sec, 15);
+                }
                 self.title_lbl.set_text(&tr.summary.title);
                 self.artist_lbl.set_text(&tr.summary.artist);
                 self.album_lbl.set_text(&tr.summary.album);
@@ -3077,7 +3276,7 @@ impl MiniPlayerWidget {
         title_lbl.set_css_classes(&["heading-md"]);
         title_lbl.set_xalign(0.0);
         title_lbl.set_ellipsize(pango::EllipsizeMode::End);
-        let sub_lbl = gtk4::Label::new(Some("Pulse Audio"));
+        let sub_lbl = gtk4::Label::new(Some("Aplayer"));
         sub_lbl.set_css_classes(&["text-secondary"]);
         sub_lbl.set_xalign(0.0);
         sub_lbl.set_ellipsize(pango::EllipsizeMode::End);

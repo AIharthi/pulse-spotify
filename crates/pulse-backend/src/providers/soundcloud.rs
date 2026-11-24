@@ -39,7 +39,7 @@ async fn http_get_bytes(http: &HttpClient, url: &str) -> Option<Bytes> {
     let req = Request::builder()
         .method(Method::GET)
         .uri(url)
-        .header(header::USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) Pulse/0.2")
+        .header(header::USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) Aplayer/0.3")
         .body(Bytes::new())
         .ok()?;
     if let Ok(Ok(body)) = tokio::time::timeout(Duration::from_secs(12), http.request_body(req)).await
@@ -73,6 +73,13 @@ fn parse_sc_track(
     item: &Value,
     liked_uris: &HashSet<String>,
 ) -> Option<(TrackSummary, CachedScTrack)> {
+    if item
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| k != "track")
+    {
+        return None;
+    }
     let policy = item.get("policy").and_then(|v| v.as_str()).unwrap_or("");
     if policy == "SNIP" || policy == "BLOCK" {
         return None;

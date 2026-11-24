@@ -7,7 +7,7 @@ use std::rc::Rc;
 use pulse_assets::AdaptiveThemeTokens;
 use pulse_model::{
     AppViewState, BackendEvent, CrateRef, CrateViewState, LibraryScope, LocalSubView, MediaSource,
-    SettingsTab, SortOrder, TrackSummary,
+    Mp3Quality, SettingsTab, SortOrder, TrackSummary,
 };
 
 use crate::icons_gtk::{CoverTextureStore, VectorIconCache};
@@ -30,6 +30,8 @@ pub struct UiBridge {
     pub open_files_dialog: Rc<dyn Fn()>,
     pub import_m3u_dialog: Rc<dyn Fn()>,
     pub export_m3u_dialog: Rc<dyn Fn(String, String)>,
+    pub choose_mp3_dir_dialog: Rc<dyn Fn()>,
+    pub save_mp3_as_dialog: Rc<dyn Fn(TrackSummary, Mp3Quality, bool)>,
     pub prompt_text_dialog: PromptDialogFn,
     pub open_external_url: Rc<dyn Fn(String)>,
 }
@@ -345,6 +347,14 @@ impl UiStore {
             BackendEvent::TelemetryUpdated(tele) => {
                 self.view.telemetry = tele;
                 DirtyFlags::SETTINGS
+            }
+            BackendEvent::Mp3DownloadStarted { uri, .. } => {
+                self.view.downloads_in_flight.insert(uri);
+                DirtyFlags::CONTENT | DirtyFlags::PLAYER_META | DirtyFlags::CHROME
+            }
+            BackendEvent::Mp3DownloadFinished { uri, .. } => {
+                self.view.downloads_in_flight.remove(&uri);
+                DirtyFlags::CONTENT | DirtyFlags::PLAYER_META | DirtyFlags::CHROME
             }
             BackendEvent::Notice(notice) => {
                 self.view.notice_banner = notice;

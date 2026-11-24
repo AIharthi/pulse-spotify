@@ -51,9 +51,11 @@ pub const YOUTUBE_MARK: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" wid
 pub const SOUNDCLOUD_MARK: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 18h6.5a3.5 3.5 0 0 0 .3-7A5.5 5.5 0 0 0 8.5 9.5"/><path d="M3 14v4M6 12v6M9 10v8"/></svg>"##;
 pub const LOCAL_DISC: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/></svg>"##;
 pub const HISTORY_RECENT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>"##;
+pub const DOWNLOAD: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>"##;
+pub const SHIELD_CHECK: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.8-7 9-4-1.2-7-4.5-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>"##;
 
 /// Exhaustive list of bundled vector icons.
-pub const ALL_ICONS: [(&str, &[u8]); 44] = [
+pub const ALL_ICONS: [(&str, &[u8]); 46] = [
     ("play", PLAY),
     ("pause", PAUSE),
     ("next", NEXT),
@@ -98,6 +100,8 @@ pub const ALL_ICONS: [(&str, &[u8]); 44] = [
     ("youtube_mark", YOUTUBE_MARK),
     ("soundcloud_mark", SOUNDCLOUD_MARK),
     ("local_disc", LOCAL_DISC),
+    ("download", DOWNLOAD),
+    ("shield_check", SHIELD_CHECK),
 ];
 
 #[cfg(test)]
@@ -106,7 +110,7 @@ mod tests {
 
     #[test]
     fn registry_contains_valid_24x24_svgs_without_text_elements() {
-        assert_eq!(ALL_ICONS.len(), 44);
+        assert_eq!(ALL_ICONS.len(), 46);
         for (name, bytes) in ALL_ICONS {
             let s = std::str::from_utf8(bytes).expect("valid utf8 svg");
             assert!(s.contains("viewBox=\"0 0 24 24\""), "{name} missing 24x24 viewBox");

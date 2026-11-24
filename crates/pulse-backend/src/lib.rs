@@ -8,6 +8,7 @@ pub mod dsp;
 pub mod library;
 pub mod local_lib;
 pub mod lyrics;
+pub mod mp3_export;
 pub mod mpris;
 pub mod player;
 pub mod providers;
@@ -28,7 +29,7 @@ use pulse_model::{
     AccountTier, AlbumSummary, AppConfig, ArtistDetail, AuthState, BackendEvent, ConnectionStatus,
     CrateRef, DeviceInfo, DevicesState, LibraryScope, LyricsState, MediaSource, PlayerState,
     PlaylistSummary, RepeatMode, SearchResults, SleepTimerTarget, SortOrder, SpectrumSnapshot,
-    TrackDetail, TrackSummary, UiCommand, VisualizerMode,
+    SponsorSegment, TrackDetail, TrackSummary, UiCommand, VisualizerMode,
 };
 use spotatui_librespot_connect::{LoadRequest, PlayingTrack};
 use spotatui_librespot_core::Session;
@@ -37,6 +38,7 @@ use spotatui_librespot_core::config::SessionConfig;
 use spotatui_librespot_core::http_client::HttpClient;
 use spotatui_librespot_core::spotify_uri::SpotifyUri;
 use spotatui_librespot_metadata::audio::{AudioItem, UniqueFields};
+use spotatui_librespot_playback::mixer::Mixer as _;
 use spotatui_librespot_playback::player::PlayerEvent;
 use tokio::sync::{mpsc, oneshot};
 
@@ -57,9 +59,9 @@ use crate::auth::{
 };
 use crate::config::{
     AppPaths, AuthMeta, RecentEntry, RecentHistory, WebApiToken, clear_audio_cache_dir,
-    clear_auth_files, clear_web_api_token, load_auth_meta, load_config, load_or_create_device_id,
-    load_recent_history, load_web_api_token, open_librespot_cache, prune_dir_to_bytes_lru,
-    save_auth_meta, save_config, save_recent_history, save_web_api_token,
+    clear_auth_files, clear_web_api_token, is_dir_covered_by_roots, load_auth_meta, load_config,
+    load_or_create_device_id, load_recent_history, load_web_api_token, open_librespot_cache,
+    prune_dir_to_bytes_lru, save_auth_meta, save_config, save_recent_history, save_web_api_token,
 };
 use crate::connect::{
     RemotePlaybackSnapshot, RemoteQueueMeta, cmd_add_to_queue, cmd_play_context, cmd_play_tracks,
@@ -72,6 +74,10 @@ use crate::dsp::SharedDsp;
 use crate::library::{LibraryService, fetch_cover_bytes, sort_track_summaries};
 use crate::local_lib::{LocalIndexedTrack, LocalLibrary, is_audio_file};
 use crate::lyrics::fetch_lyrics_for_track;
+use crate::mp3_export::{
+    build_sponsor_aselect_filter, resolve_unique_mp3_path, sanitize_filename_stem,
+    transcode_and_tag_mp3_blocking,
+};
 use crate::mpris::MprisController;
 use crate::player::{
     ClusterStream, LocalPlayback, audio_pipeline_changed, build_context_load_request,
@@ -83,7 +89,8 @@ use crate::providers::soundcloud::{
     ScResolved, ensure_soundcloud_audio_cached, resolve_soundcloud_url, search_soundcloud,
 };
 use crate::providers::youtube::{
-    ensure_youtube_audio_cached, resolve_youtube_playlist, resolve_youtube_video, search_youtube,
+    ensure_youtube_audio_cached, fetch_youtube_cover_jpeg, fetch_youtube_skip_segments,
+    resolve_youtube_playlist, resolve_youtube_video, search_youtube,
 };
 use crate::providers::{ResolvedInput, parse_direct_input};
 use crate::queue::TwoTierQueue;
@@ -282,6 +289,15 @@ enum InternalMsg {
         uri: String,
         state: LyricsState,
     },
+    SponsorSegmentsLoaded {
+        uri: String,
+        segments: Vec<SponsorSegment>,
+    },
+    Mp3ExportFinished {
+        uri: String,
+        auto_index: bool,
+        result: Result<PathBuf, String>,
+    },
     DisplayNameLoaded {
         session_gen: u64,
         name: String,
@@ -424,6 +440,11 @@ struct BackendState {
     sleep_end_of_track: bool,
     active_play_counted: bool,
     last_ab_seek_at: Instant,
+    active_sponsor_segments: Vec<SponsorSegment>,
+    skipped_sponsor_starts: HashSet<u32>,
+    last_sponsor_skip_at: Instant,
+    ad_muted_restore_vol: Option<u16>,
+    downloads_in_flight: HashSet<String>,
 }
 
 impl BackendState {
@@ -531,7 +552,7 @@ impl BackendState {
             return;
         }
         let Ok(cache) = open_librespot_cache(&self.paths, &self.config) else {
-            emitter.error("failed to open Pulse cache directory");
+            emitter.error("failed to open Aplayer cache directory");
             return;
         };
         let Some(creds) = cache.credentials().or_else(|| self.current_creds.clone()) else {
@@ -728,6 +749,11 @@ async fn actor_main(
         sleep_end_of_track: false,
         active_play_counted: false,
         last_ab_seek_at: Instant::now(),
+        active_sponsor_segments: Vec::new(),
+        skipped_sponsor_starts: HashSet::new(),
+        last_sponsor_skip_at: Instant::now(),
+        ad_muted_restore_vol: None,
+        downloads_in_flight: HashSet::new(),
     };
 
     // Restore previous queue & track cleanly (paused, ready to resume).
@@ -1040,7 +1066,7 @@ fn spawn_session_connect(
     emitter.emit(BackendEvent::ConnectionChanged(state.conn_status.clone()));
 
     let Ok(cache) = open_librespot_cache(&state.paths, &state.config) else {
-        let msg = "failed to open Pulse cache directory".to_string();
+        let msg = "failed to open Aplayer cache directory".to_string();
         state.conn_status = ConnectionStatus::Error(msg.clone());
         emitter.emit(BackendEvent::ConnectionChanged(state.conn_status.clone()));
         emitter.error(msg);
@@ -2276,6 +2302,147 @@ async fn handle_ui_command(
             state.config.resume_session_on_startup = resume;
             state.save_current_config(emitter);
         }
+        UiCommand::SetAdBlockEnabled(enabled) => {
+            state.config.ad_block_enabled = enabled;
+            if !enabled
+                && let Some(restore_vol) = state.ad_muted_restore_vol.take()
+                && let Some(ref lp) = state.local_playback
+            {
+                lp.mixer.set_volume(restore_vol);
+            }
+            state.save_current_config(emitter);
+            emitter.emit(BackendEvent::Notice(Some(if enabled {
+                "Ad-Free Shield & SponsorBlock enabled.".to_string()
+            } else {
+                "Ad-Free Shield disabled.".to_string()
+            })));
+        }
+        UiCommand::SetMp3DownloadDir(dir) => {
+            let trimmed = dir.trim().to_string();
+            if !trimmed.is_empty() {
+                let _ = fs::create_dir_all(&trimmed);
+                state.config.mp3_download_dir = trimmed.clone();
+                if state.config.mp3_auto_add_to_library
+                    && !is_dir_covered_by_roots(&state.config.local_music_dirs, Path::new(&trimmed))
+                {
+                    state.config.local_music_dirs.push(trimmed);
+                    state.emit_local_status(emitter, true);
+                    spawn_local_scan(state, int_tx);
+                }
+                state.save_current_config(emitter);
+            }
+        }
+        UiCommand::SetMp3Quality(quality) => {
+            state.config.mp3_quality = quality;
+            state.save_current_config(emitter);
+        }
+        UiCommand::SetMp3AutoAddToLibrary(auto_add) => {
+            state.config.mp3_auto_add_to_library = auto_add;
+            if auto_add {
+                let dl = PathBuf::from(&state.config.mp3_download_dir);
+                if dl.is_dir() && !is_dir_covered_by_roots(&state.config.local_music_dirs, &dl) {
+                    state.config.local_music_dirs.push(state.config.mp3_download_dir.clone());
+                    state.emit_local_status(emitter, true);
+                    spawn_local_scan(state, int_tx);
+                }
+            }
+            state.save_current_config(emitter);
+        }
+        UiCommand::SetMp3StripSponsors(strip) => {
+            state.config.mp3_strip_sponsors = strip;
+            state.save_current_config(emitter);
+        }
+        UiCommand::SaveYouTubeMp3 {
+            track,
+            dest_path,
+            quality,
+            strip_sponsors,
+        } => {
+            if track.source != MediaSource::YouTube {
+                emitter.error("Only YouTube tracks can be saved as MP3.");
+                return;
+            }
+            let Some(vid) = track.uri.strip_prefix("yt:video:").filter(|v| v.len() == 11) else {
+                emitter.error("Invalid YouTube track URI for MP3 export.");
+                return;
+            };
+            let uri_str = track.uri.to_string();
+            if !state.downloads_in_flight.insert(uri_str.clone()) {
+                emitter.emit(BackendEvent::Notice(Some(
+                    "MP3 save is already in progress for this track.".to_string(),
+                )));
+                return;
+            }
+            let chosen_quality = quality.unwrap_or(state.config.mp3_quality);
+            let chosen_strip = strip_sponsors.unwrap_or(state.config.mp3_strip_sponsors);
+            let auto_index = state.config.mp3_auto_add_to_library;
+            let dl_dir = PathBuf::from(&state.config.mp3_download_dir);
+            let vid = vid.to_string();
+            let http = Arc::clone(&state.http);
+            let paths = state.paths.clone();
+            let tx = int_tx.clone();
+            let title = track.title.clone();
+
+            emitter.emit(BackendEvent::Mp3DownloadStarted {
+                uri: uri_str.clone(),
+                title: title.clone(),
+            });
+            emitter.emit(BackendEvent::Notice(Some(format!(
+                "Saving MP3 ({}): {} - {}...",
+                chosen_quality.label(),
+                track.artist,
+                track.title
+            ))));
+
+            tokio::task::spawn_local(async move {
+                let res = async {
+                    let (cached_path, _) = ensure_youtube_audio_cached(&http, &paths, &vid).await?;
+                    let segments = if chosen_strip {
+                        fetch_youtube_skip_segments(&http, &vid).await
+                    } else {
+                        Vec::new()
+                    };
+                    let filter = build_sponsor_aselect_filter(&segments, track.duration_ms);
+                    let cover = fetch_youtube_cover_jpeg(&http, &vid).await;
+                    let dest = if let Some(raw_dest) = dest_path {
+                        let mut pb = PathBuf::from(raw_dest);
+                        if pb
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_none_or(|ext| !ext.eq_ignore_ascii_case("mp3"))
+                        {
+                            pb.set_extension("mp3");
+                        }
+                        pb
+                    } else {
+                        let stem = sanitize_filename_stem(&track.artist, &track.title);
+                        resolve_unique_mp3_path(&dl_dir, &stem)?
+                    };
+                    let tr_c = track.clone();
+                    let vid_c = vid.clone();
+                    tokio::task::spawn_blocking(move || {
+                        transcode_and_tag_mp3_blocking(
+                            &cached_path,
+                            &dest,
+                            chosen_quality,
+                            filter.as_deref(),
+                            &tr_c,
+                            &vid_c,
+                            cover.as_deref(),
+                        )
+                    })
+                    .await
+                    .map_err(|e| format!("MP3 worker task failed: {e}"))?
+                }
+                .await;
+
+                let _ = tx.send(InternalMsg::Mp3ExportFinished {
+                    uri: uri_str,
+                    auto_index,
+                    result: res,
+                });
+            });
+        }
         UiCommand::SetScope(scope) => {
             let target = match scope {
                 LibraryScope::Home => Some(CrateRef::Home),
@@ -3129,6 +3296,8 @@ async fn load_single_track_locally(
 ) {
     state.active_play_counted = false;
     state.player_state.ab_loop = Default::default();
+    state.active_sponsor_segments.clear();
+    state.skipped_sponsor_starts.clear();
     let mut track = track.clone();
     if state.likes_store.uri_set().contains(track.uri.as_ref()) {
         track.is_liked = true;
@@ -3137,6 +3306,22 @@ async fn load_single_track_locally(
     set_optimistic_playing_track(state, &track, int_tx, emitter);
     if !start_playing {
         state.player_state.is_playing = false;
+    }
+
+    if track.source == MediaSource::YouTube
+        && state.config.ad_block_enabled
+        && let Some(vid) = track.uri.strip_prefix("yt:video:").filter(|v| v.len() == 11)
+    {
+        let http = Arc::clone(&state.http);
+        let uri = track.uri.to_string();
+        let vid = vid.to_string();
+        let tx = int_tx.clone();
+        tokio::task::spawn_local(async move {
+            let segments = fetch_youtube_skip_segments(&http, &vid).await;
+            if !segments.is_empty() {
+                let _ = tx.send(InternalMsg::SponsorSegmentsLoaded { uri, segments });
+            }
+        });
     }
 
     match track.source {
@@ -3477,6 +3662,44 @@ async fn handle_internal_msg(
                     seek_active_ms(state, a, emitter);
                     return;
                 }
+                // Check SponsorBlock auto-skip when Ad-Free Shield is active
+                if state.config.ad_block_enabled
+                    && state.player_state.ab_loop.b_ms.is_none()
+                    && state.last_sponsor_skip_at.elapsed() >= Duration::from_millis(1200)
+                    && let Some(seg) = state
+                        .active_sponsor_segments
+                        .iter()
+                        .find(|seg| {
+                            !state.skipped_sponsor_starts.contains(&seg.start_ms)
+                                && position_ms >= seg.start_ms
+                                && position_ms.saturating_add(350) < seg.end_ms
+                        })
+                        .cloned()
+                {
+                    state.skipped_sponsor_starts.insert(seg.start_ms);
+                    state.last_sponsor_skip_at = Instant::now();
+                    if state.player_state.duration_ms > 0
+                        && seg.end_ms.saturating_add(800) >= state.player_state.duration_ms
+                    {
+                        let wrap = state.player_state.repeat == RepeatMode::Context;
+                        if let Some(next) = state.queue.step_next_track(wrap) {
+                            emitter.emit(BackendEvent::Notice(Some(format!(
+                                "Ad-Free Shield skipped ending {} segment",
+                                seg.category
+                            ))));
+                            state.emit_queue(emitter);
+                            load_single_track_locally(state, &next, 0, true, int_tx, emitter)
+                                .await;
+                            return;
+                        }
+                    }
+                    emitter.emit(BackendEvent::Notice(Some(format!(
+                        "Ad-Free Shield skipped {} segment",
+                        seg.category
+                    ))));
+                    seek_active_ms(state, seg.end_ms, emitter);
+                    return;
+                }
                 state.player_state.position_ms = position_ms;
                 if let Some(ref mpris) = state.mpris {
                     mpris.update_position(position_ms);
@@ -3541,6 +3764,69 @@ async fn handle_internal_msg(
                 }
                 state.current_lyrics = lyrics_state.clone();
                 emitter.emit(BackendEvent::LyricsLoaded(lyrics_state));
+            }
+        }
+        InternalMsg::SponsorSegmentsLoaded { uri, segments } => {
+            if state.current_playing_uri.as_deref() == Some(uri.as_str())
+                || state.active_direct_uri.as_deref() == Some(uri.as_str())
+            {
+                state.active_sponsor_segments = segments;
+                if state.config.ad_block_enabled
+                    && state.player_state.ab_loop.b_ms.is_none()
+                    && let Some(first) = state.active_sponsor_segments.first().cloned()
+                    && first.start_ms <= 800
+                    && state.player_state.position_ms.saturating_add(350) < first.end_ms
+                {
+                    state.skipped_sponsor_starts.insert(first.start_ms);
+                    state.last_sponsor_skip_at = Instant::now();
+                    emitter.emit(BackendEvent::Notice(Some(format!(
+                        "Ad-Free Shield skipped intro {} segment",
+                        first.category
+                    ))));
+                    seek_active_ms(state, first.end_ms, emitter);
+                }
+            }
+        }
+        InternalMsg::Mp3ExportFinished {
+            uri,
+            auto_index,
+            result,
+        } => {
+            state.downloads_in_flight.remove(&uri);
+            match result {
+                Ok(saved_path) => {
+                    if auto_index {
+                        let _ = state.local_lib.index_ad_hoc_path(&state.paths, &saved_path);
+                        state.emit_local_status(emitter, false);
+                        if matches!(state.current_crate, CrateRef::Home | CrateRef::LocalTracks) {
+                            spawn_crate_fetch(
+                                state,
+                                state.current_crate.clone(),
+                                0,
+                                100,
+                                int_tx,
+                                emitter,
+                            );
+                        }
+                    }
+                    let path_str = saved_path.to_string_lossy().to_string();
+                    emitter.emit(BackendEvent::Mp3DownloadFinished {
+                        uri,
+                        saved_path: Some(path_str.clone()),
+                        error: None,
+                    });
+                    emitter.emit(BackendEvent::Notice(Some(format!(
+                        "Saved MP3: {path_str}"
+                    ))));
+                }
+                Err(err) => {
+                    emitter.emit(BackendEvent::Mp3DownloadFinished {
+                        uri,
+                        saved_path: None,
+                        error: Some(err.clone()),
+                    });
+                    emitter.error(format!("MP3 save failed: {err}"));
+                }
             }
         }
         InternalMsg::LibrespotOAuthFinished { attempt_id, result } => {
@@ -4149,6 +4435,19 @@ async fn handle_player_event(
             position_ms,
         } => {
             let uri_str = track_id.to_uri();
+            if state.config.ad_block_enabled && uri_str.starts_with("spotify:ad:") {
+                if state.ad_muted_restore_vol.is_none() {
+                    state.ad_muted_restore_vol = Some(state.player_state.volume);
+                }
+                if let Some(ref lp) = state.local_playback {
+                    lp.mixer.set_volume(0);
+                    let _ = lp.spirc.next();
+                }
+                emitter.emit(BackendEvent::Notice(Some(
+                    "Ad-Free Shield muted Spotify ad.".to_string(),
+                )));
+                return;
+            }
             if state
                 .pending_local_load_uri
                 .as_deref()
@@ -4314,6 +4613,21 @@ async fn handle_player_event(
         }
         PlayerEvent::TrackChanged { audio_item } => {
             let uri_str = audio_item.track_id.to_uri();
+            if state.config.ad_block_enabled && uri_str.starts_with("spotify:ad:") {
+                if state.ad_muted_restore_vol.is_none() {
+                    state.ad_muted_restore_vol = Some(state.player_state.volume);
+                }
+                if let Some(ref lp) = state.local_playback {
+                    lp.mixer.set_volume(0);
+                    let _ = lp.spirc.next();
+                }
+                return;
+            }
+            if let Some(restore_vol) = state.ad_muted_restore_vol.take()
+                && let Some(ref lp) = state.local_playback
+            {
+                lp.mixer.set_volume(restore_vol);
+            }
             if state
                 .pending_local_load_uri
                 .as_deref()
@@ -5306,7 +5620,7 @@ mod tests {
         let root = temp_root("cfg");
         let paths = AppPaths::for_root(&root);
         let cfg = AppConfig {
-            device_name: "Pulse Gentoo".to_string(),
+            device_name: "Aplayer Gentoo".to_string(),
             stream_quality: StreamQuality::Kbps160,
             normalisation: NormalisationMode::Track,
             disk_audio_cache_mb: 128,
@@ -5316,7 +5630,7 @@ mod tests {
         save_config(&paths, &cfg).unwrap();
 
         let loaded = load_config(&paths);
-        assert_eq!(loaded.device_name, "Pulse Gentoo");
+        assert_eq!(loaded.device_name, "Aplayer Gentoo");
         assert_eq!(loaded.stream_quality, StreamQuality::Kbps160);
         assert_eq!(loaded.normalisation, NormalisationMode::Track);
         assert_eq!(loaded.disk_audio_cache_mb, 128);
@@ -5356,7 +5670,7 @@ mod tests {
     #[test]
     fn proc_status_parser_extracts_rss_and_hwm() {
         let sample = "\
-Name:\tpulse-spotify\n\
+Name:\taplayer\n\
 State:\tS (sleeping)\n\
 VmHWM:\t   34560 kB\n\
 VmRSS:\t   28160 kB\n\
@@ -5400,7 +5714,7 @@ Threads:\t2\n";
                 "-metadata",
                 "title=E2E Master Signal",
                 "-metadata",
-                "artist=Pulse Verification",
+                "artist=Aplayer Verification",
                 "-metadata",
                 "album=Runtime Suite",
                 flac_path.to_str().unwrap(),
@@ -5423,7 +5737,7 @@ Threads:\t2\n";
                 "-metadata",
                 "title=E2E Opus Stream",
                 "-metadata",
-                "artist=Pulse Verification",
+                "artist=Aplayer Verification",
                 opus_path.to_str().unwrap(),
             ])
             .status()
@@ -5480,12 +5794,51 @@ Threads:\t2\n";
 
             let yt = search_youtube(&http, "Daft Punk Around the World", &liked).await;
             assert!(!yt.is_empty(), "YouTube search should return tracks");
-            let vid = yt[0].uri.strip_prefix("yt:video:").unwrap();
-            let resolved_yt = resolve_youtube_video(&http, vid, &liked).await;
+            let vid = yt[0].uri.strip_prefix("yt:video:").unwrap().to_string();
+            let resolved_yt = resolve_youtube_video(&http, &vid, &liked).await;
             assert!(
                 resolved_yt.is_ok(),
                 "YouTube video resolution should succeed for {vid}: {:?}",
                 resolved_yt.err()
+            );
+
+            // Live YouTube audio cache + SponsorBlock + MP3 transcode + ID3 verification
+            let (yt_cached, yt_codec) = ensure_youtube_audio_cached(&http, &paths, &vid)
+                .await
+                .expect("YouTube audio cache stage");
+            let sb_segs = fetch_youtube_skip_segments(&http, &vid).await;
+            let yt_track = resolved_yt.unwrap();
+            let mp3_out = root.join("yt_e2e_export.mp3");
+            let filter = build_sponsor_aselect_filter(&sb_segs, yt_track.duration_ms);
+            let cover = fetch_youtube_cover_jpeg(&http, &vid).await;
+            let saved_mp3 = transcode_and_tag_mp3_blocking(
+                &yt_cached,
+                &mp3_out,
+                pulse_model::Mp3Quality::Cbr192,
+                filter.as_deref(),
+                &yt_track,
+                &vid,
+                cover.as_deref(),
+            )
+            .expect("live YouTube MP3 export");
+            let ffprobe_out = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name:format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                ])
+                .arg(&saved_mp3)
+                .output()
+                .expect("ffprobe mp3");
+            let ffprobe_txt = String::from_utf8_lossy(&ffprobe_out.stdout);
+            assert!(
+                ffprobe_txt.contains("codec_name=mp3"),
+                "expected mp3 stream, got {ffprobe_txt}"
             );
 
             let (sc_tracks, _) = search_soundcloud(&http, &paths, "electronic ambient", &liked).await;
@@ -5510,9 +5863,12 @@ Threads:\t2\n";
             let lyr = fetch_lyrics_for_track(&http, &paths, &query_tr).await;
             assert!(!lyr.lines.is_empty(), "LRCLIB live fetch should return lyrics lines");
             println!(
-                "E2E OK: local={} yt={} sc={} lrclib_lines={}",
+                "E2E OK: local={} yt={} yt_codec={} sb_segs={} mp3_bytes={} sc={} lrclib_lines={}",
                 rescan.len(),
                 yt.len(),
+                yt_codec,
+                sb_segs.len(),
+                fs::metadata(&saved_mp3).map(|m| m.len()).unwrap_or(0),
                 sc_tracks.len(),
                 lyr.lines.len()
             );

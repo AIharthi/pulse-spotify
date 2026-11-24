@@ -150,8 +150,16 @@ impl LocalLibrary {
         let prev_map = HashMap::new();
         let mut seen = HashSet::new();
         let item = index_single_file(paths, path, &prev_map, &mut seen)?;
-        if !self.tracks.iter().any(|t| t.path == item.path) {
+        if let Some(slot) = self.tracks.iter_mut().find(|t| t.path == item.path) {
+            *slot = item.clone();
+        } else {
             self.tracks.push(item.clone());
+        }
+        let index_path = paths.cache_dir.join("local_index.json");
+        if let Ok(json) = serde_json::to_vec(&LocalIndexDisk {
+            tracks: self.tracks.clone(),
+        }) {
+            let _ = write_atomic(&index_path, &json, false);
         }
         Some(item)
     }

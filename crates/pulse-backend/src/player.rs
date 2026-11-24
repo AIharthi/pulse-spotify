@@ -132,10 +132,10 @@ impl Sink for LowLatencyPulseSink {
             };
             let sink = Simple::new(
                 None,
-                "Pulse",
+                "Aplayer",
                 pulse::stream::Direction::Playback,
                 self.device.as_deref(),
-                "Pulse Spotify Player",
+                "Aplayer Spotify Player",
                 &sample_spec,
                 None,
                 Some(&attr),

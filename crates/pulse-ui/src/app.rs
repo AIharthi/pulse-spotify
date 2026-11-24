@@ -25,7 +25,7 @@ use crate::views::{
 /// Launches the native GTK4 application and blocks until exit.
 pub fn run(launch: PulseAppLaunch) -> Result<(), String> {
     let app = gtk4::Application::builder()
-        .application_id("dev.pulse.Spotify")
+        .application_id("dev.aplayer.Player")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
@@ -50,7 +50,7 @@ pub fn run(launch: PulseAppLaunch) -> Result<(), String> {
 
         let window = gtk4::ApplicationWindow::builder()
             .application(app)
-            .title("Pulse")
+            .title("Aplayer")
             .default_width(1280)
             .default_height(820)
             .build();
@@ -166,6 +166,90 @@ pub fn run(launch: PulseAppLaunch) -> Result<(), String> {
         });
 
         let win_weak = window.downgrade();
+        let send_mp3_dir = launch.command_sender.clone();
+        let store_mp3_dir = Rc::clone(&store);
+        let choose_mp3_dir_dialog: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(win) = win_weak.upgrade() else { return };
+            let dlg_b = gtk4::FileDialog::builder()
+                .title("Select MP3 Download Folder")
+                .modal(true);
+            let cur_dir = store_mp3_dir.borrow().view.config.mp3_download_dir.clone();
+            let dlg = if !cur_dir.is_empty() && std::path::Path::new(&cur_dir).is_dir() {
+                dlg_b
+                    .initial_folder(&gio::File::for_path(std::path::Path::new(&cur_dir)))
+                    .build()
+            } else {
+                dlg_b.build()
+            };
+            let send = send_mp3_dir.clone();
+            dlg.select_folder(Some(&win), gio::Cancellable::NONE, move |res| {
+                if let Ok(file) = res
+                    && let Some(path) = file.path()
+                {
+                    (send)(UiCommand::SetMp3DownloadDir(
+                        path.to_string_lossy().to_string(),
+                    ));
+                }
+            });
+        });
+
+        let win_weak = window.downgrade();
+        let send_mp3_as = launch.command_sender.clone();
+        let store_mp3_as = Rc::clone(&store);
+        let save_mp3_as_dialog: Rc<dyn Fn(pulse_model::TrackSummary, pulse_model::Mp3Quality, bool)> =
+            Rc::new(move |track, quality, strip_sponsors| {
+                let Some(win) = win_weak.upgrade() else { return };
+                let stem_raw = if track.artist.trim().is_empty()
+                    || track.artist.eq_ignore_ascii_case("YouTube")
+                {
+                    track.title.clone()
+                } else {
+                    format!("{} - {}", track.artist, track.title)
+                };
+                let sanitized: String = stem_raw
+                    .chars()
+                    .map(|c| match c {
+                        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                        _ => c,
+                    })
+                    .take(120)
+                    .collect();
+                let init_name = format!(
+                    "{}.mp3",
+                    if sanitized.trim().is_empty() {
+                        "youtube_track"
+                    } else {
+                        sanitized.trim()
+                    }
+                );
+                let dlg_b = gtk4::FileDialog::builder()
+                    .title("Save YouTube Audio as MP3")
+                    .initial_name(init_name)
+                    .modal(true);
+                let cur_dir = store_mp3_as.borrow().view.config.mp3_download_dir.clone();
+                let dlg = if !cur_dir.is_empty() && std::path::Path::new(&cur_dir).is_dir() {
+                    dlg_b
+                        .initial_folder(&gio::File::for_path(std::path::Path::new(&cur_dir)))
+                        .build()
+                } else {
+                    dlg_b.build()
+                };
+                let send = send_mp3_as.clone();
+                dlg.save(Some(&win), gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res
+                        && let Some(path) = file.path()
+                    {
+                        (send)(UiCommand::SaveYouTubeMp3 {
+                            track: track.clone(),
+                            dest_path: Some(path.to_string_lossy().to_string()),
+                            quality: Some(quality),
+                            strip_sponsors: Some(strip_sponsors),
+                        });
+                    }
+                });
+            });
+
+        let win_weak = window.downgrade();
         let prompt_text_dialog: PromptDialogFn =
             Rc::new(move |title, placeholder, initial, on_confirm| {
                 let Some(parent) = win_weak.upgrade() else { return };
@@ -256,6 +340,31 @@ pub fn run(launch: PulseAppLaunch) -> Result<(), String> {
                 (redraw_cmd)(DirtyFlags::PLAYER_META | DirtyFlags::CHROME);
                 (raw_send)(UiCommand::SetVisualizerMode(vis));
             }
+            UiCommand::SetAdBlockEnabled(enabled) => {
+                store_cmd.borrow_mut().view.config.ad_block_enabled = enabled;
+                (redraw_cmd)(DirtyFlags::CHROME | DirtyFlags::SETTINGS);
+                (raw_send)(UiCommand::SetAdBlockEnabled(enabled));
+            }
+            UiCommand::SetMp3DownloadDir(dir) => {
+                store_cmd.borrow_mut().view.config.mp3_download_dir = dir.clone();
+                (redraw_cmd)(DirtyFlags::SETTINGS | DirtyFlags::CHROME);
+                (raw_send)(UiCommand::SetMp3DownloadDir(dir));
+            }
+            UiCommand::SetMp3Quality(q) => {
+                store_cmd.borrow_mut().view.config.mp3_quality = q;
+                (redraw_cmd)(DirtyFlags::SETTINGS);
+                (raw_send)(UiCommand::SetMp3Quality(q));
+            }
+            UiCommand::SetMp3AutoAddToLibrary(v) => {
+                store_cmd.borrow_mut().view.config.mp3_auto_add_to_library = v;
+                (redraw_cmd)(DirtyFlags::SETTINGS);
+                (raw_send)(UiCommand::SetMp3AutoAddToLibrary(v));
+            }
+            UiCommand::SetMp3StripSponsors(v) => {
+                store_cmd.borrow_mut().view.config.mp3_strip_sponsors = v;
+                (redraw_cmd)(DirtyFlags::SETTINGS);
+                (raw_send)(UiCommand::SetMp3StripSponsors(v));
+            }
             other => (raw_send)(other),
         });
 
@@ -270,6 +379,8 @@ pub fn run(launch: PulseAppLaunch) -> Result<(), String> {
             open_files_dialog,
             import_m3u_dialog,
             export_m3u_dialog,
+            choose_mp3_dir_dialog,
+            save_mp3_as_dialog,
             prompt_text_dialog,
             open_external_url,
         };

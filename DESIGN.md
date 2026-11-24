@@ -1,14 +1,14 @@
-# Pulse Design System
+# Aplayer Design System
 
 ## Design Read
 Reading this as: native Linux multi-source music player and audio studio for desktop listeners, in a Dynamic Album-Reactive Deck style, dial ENERGY 2 / RHYTHM 2 / MOTION 2.
 
 ## Spatial Architecture
-1. **Top Command Header (`52px`)**: Navigation rail collapse toggle, Back/Forward crate history, Mode Switcher (`Deck`, `Stage`, `Mini`), Unified Omnibox (`/` filter or `Ctrl+K` multi-source search and direct URL resolver), Sleep Timer status button, Playback Device Switcher (`D`), Dark/Light theme toggle, and Settings trigger (`Ctrl+,`).
+1. **Top Command Header (`52px`)**: Navigation rail collapse toggle, Back/Forward crate history, Mode Switcher (`Deck`, `Stage`, `Mini`), Unified Omnibox (`/` filter or `Ctrl+K` multi-source search and direct URL resolver), Sleep Timer status button, Playback Device Switcher (`D`), Ad-Free Shield toggle (`SponsorBlock` + ad filtering), Dark/Light theme toggle, and Settings trigger (`Ctrl+,`).
 2. **Left Source & Library Rail (`212px`, collapses to `56px` icon rail `< 980px` and compact drawer `< 780px`)**: Grouped with quiet sentence-case labels (`Library`, `Streaming`). Every destination maps directly to live content; active destination uses tonal fill + full subtle border + bold primary label (zero one-sided colored stripes).
 3. **Center Content Canvas**: Virtualized GTK4 `ListView` (`SignalListItemFactory` + `gio::ListStore`) and adaptive card grids with explicit Loading, Empty (naming cause + action), and Error (naming error + retry) states.
 4. **Right Studio Drawer (`320px`, toggleable tabs)**: `Queue`, `Lyrics` (clickable synced LRC timestamps + offset adjust), `EQ & FX` (10-band biquad EQ + speed/pitch), and `Insights` (real local listening breakdown).
-5. **Bottom Playback & Visualizer Deck (`88px`)**: Cover art (`60x60`) + metadata + source/codec chip + Favorite (`L`); Transport cluster (`Shuffle`, `Prev`, `Play/Pause`, `Next`, `Repeat`, `A-B Loop`) + precision deferred-seek scrubber (`IBM Plex Mono`); Live Cairo Visualizer (`Spectrum` / `Waveform` / `VU Meters` / `Off` with pause/off control) + Volume & Drawer buttons.
+5. **Bottom Playback & Visualizer Deck (`88px`)**: Cover art (`60x60`) + metadata + source/codec chip + Save MP3 button (`Ctrl+D` on YouTube tracks) + Favorite (`L`); Transport cluster (`Shuffle`, `Prev`, `Play/Pause`, `Next`, `Repeat`, `A-B Loop`) + precision deferred-seek scrubber (`IBM Plex Mono`); Live Cairo Visualizer (`Spectrum` / `Waveform` / `VU Meters` / `Off` with pause/off control) + Volume & Drawer buttons.
 6. **Immersive Stage (`2` / `F`) & Mini-Player (`3` / `Shift+M`)**: Full album showcase with side-by-side live karaoke lyrics, full-width spectrum visualizer, and `430x124` compact desk controller.
 
 ## Adaptive Dual-Theme Color System (WCAG AA Enforced)

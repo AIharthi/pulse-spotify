@@ -341,10 +341,10 @@ pub struct CoverCache {
 }
 
 impl CoverCache {
-    /// Creates a cache rooted at `$XDG_CACHE_HOME/pulse-spotify/covers/`.
+    /// Creates a cache rooted at `$XDG_CACHE_HOME/aplayer/covers/`.
     pub fn new(disk_cap_mb: u64) -> Self {
         let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        Self::with_dir(base.join("pulse-spotify").join("covers"), disk_cap_mb)
+        Self::with_dir(base.join("aplayer").join("covers"), disk_cap_mb)
     }
 
     /// Creates a cache at an explicit directory (primarily for deterministic testing).

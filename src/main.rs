@@ -1,4 +1,4 @@
-//! Pulse desktop binary entry point (native GTK4 + Cairo UI and `pulse-backend`).
+//! Aplayer desktop binary entry point (native GTK4 + Cairo UI and `pulse-backend`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,8 @@ fn main() {
     // before spawning any runtime or UI threads.
     unsafe {
         std::env::set_var("TOKIO_WORKER_THREADS", "2");
-        std::env::set_var("PULSE_PROP_application.name", "Pulse");
-        std::env::set_var("PULSE_PROP_application.icon_name", "pulse-spotify");
+        std::env::set_var("PULSE_PROP_application.name", "Aplayer");
+        std::env::set_var("PULSE_PROP_application.icon_name", "aplayer");
         std::env::set_var("PULSE_PROP_media.role", "music");
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
@@ -36,7 +36,7 @@ fn main() {
     let (backend, event_rx) = match BackendHandle::spawn(Arc::new(|| {})) {
         Ok(pair) => pair,
         Err(err) => {
-            eprintln!("pulse-spotify startup error: {err}");
+            eprintln!("aplayer startup error: {err}");
             std::process::exit(1);
         }
     };
@@ -48,7 +48,7 @@ fn main() {
     };
 
     // Disable CoverCache's disk tier so `pulse-backend::library` exclusively owns
-    // `$XDG_CACHE_HOME/pulse-spotify/covers/` without double disk caching.
+    // `$XDG_CACHE_HOME/aplayer/covers/` without double disk caching.
     let cover_cache = Arc::new(CoverCache::with_dir(PathBuf::new(), 0));
 
     let backend_for_cmds = Arc::downgrade(&backend);
@@ -119,7 +119,7 @@ fn main() {
     }
 
     if let Err(err) = ui_result {
-        eprintln!("pulse-spotify GUI error: {err}");
+        eprintln!("aplayer GUI error: {err}");
         std::process::exit(1);
     }
 }

@@ -252,7 +252,7 @@ pub async fn wait_for_oauth_callback(
                         write_http_response(
                             &mut stream,
                             400,
-                            "OAuth state mismatch. Please retry login in Pulse.",
+                            "OAuth state mismatch. Please retry login in Aplayer.",
                         );
                         continue;
                     }
@@ -274,7 +274,7 @@ pub async fn wait_for_oauth_callback(
                     write_http_response(
                         &mut stream,
                         200,
-                        "Pulse Spotify login complete. You may close this browser tab.",
+                        "Aplayer Spotify login complete. You may close this browser tab.",
                     );
                     return Ok(code.clone());
                 }
@@ -356,11 +356,11 @@ fn write_http_response(stream: &mut std::net::TcpStream, status: u16, message: &
     };
     let safe_message = html_escape(message);
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pulse Spotify</title>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Aplayer</title>\
          <style>body{{font-family:sans-serif;background:#121316;color:#f4f4f5;\
          display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}\
          .card{{background:#1b1d22;padding:28px 34px;border-radius:12px;border:1px solid #2b2e36;}}</style>\
-         </head><body><div class=\"card\"><h3>Pulse</h3><p>{safe_message}</p></div></body></html>"
+         </head><body><div class=\"card\"><h3>Aplayer</h3><p>{safe_message}</p></div></body></html>"
     );
     let reply = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
