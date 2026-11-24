@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protobuf::Message;
 use pulse_model::{
-    AppConfig, DeviceInfo as ModelDeviceInfo, DevicesState, ImageRef, RepeatMode, TrackDetail,
-    TrackSummary,
+    AppConfig, DeviceInfo as ModelDeviceInfo, DevicesState, ImageRef, MediaSource, RepeatMode,
+    TrackDetail, TrackSummary,
 };
 use serde_json::json;
 use spotatui_librespot_core::{Session, version};
@@ -55,7 +55,7 @@ pub fn image_ref_from_raw(raw: &str) -> Option<ImageRef> {
             url: Some(Arc::from(format!("https://i.scdn.co/image/{id}"))),
         });
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with("file://") {
         let id = trimmed
             .strip_prefix("https://i.scdn.co/image/")
             .or_else(|| trimmed.strip_prefix("http://i.scdn.co/image/"))
@@ -407,6 +407,9 @@ fn track_summary_from_provided(t: &ProvidedTrack) -> TrackSummary {
         is_liked: false,
         is_playable: true,
         added_at_unix: None,
+        source: MediaSource::from_uri(&t.uri),
+        local_path: None,
+        codec_label: None,
     }
 }
 

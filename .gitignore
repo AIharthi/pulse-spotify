@@ -13,3 +13,9 @@ device_id
 *.token
 *.key
 .DS_Store
+
+# Impeccable runtime review captures
+.impeccable/review/
+.impeccable/mocks/
+.impeccable/questions/
+

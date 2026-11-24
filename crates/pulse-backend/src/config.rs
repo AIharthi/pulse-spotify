@@ -134,19 +134,26 @@ impl RecentHistory {
 
 /// Loads [`AppConfig`] from `$XDG_CONFIG_HOME/pulse-spotify/config.json`, falling back to defaults.
 pub fn load_config(paths: &AppPaths) -> AppConfig {
-    let Ok(bytes) = fs::read(&paths.config_file) else {
-        return AppConfig::default();
+    let mut cfg = match fs::read(&paths.config_file) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                log::warn!(
+                    "invalid config at {}, using defaults: {err}",
+                    paths.config_file.display()
+                );
+                AppConfig::default()
+            }
+        },
+        Err(_) => AppConfig::default(),
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            log::warn!(
-                "invalid config at {}, using defaults: {err}",
-                paths.config_file.display()
-            );
-            AppConfig::default()
-        }
+    if cfg.local_music_dirs.is_empty()
+        && let Some(music_dir) = dirs::audio_dir()
+        && music_dir.is_dir()
+    {
+        cfg.local_music_dirs.push(music_dir.to_string_lossy().to_string());
     }
+    cfg
 }
 
 /// Saves [`AppConfig`] cleanly to disk.

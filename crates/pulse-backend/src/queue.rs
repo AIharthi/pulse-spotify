@@ -108,6 +108,34 @@ impl TwoTierQueue {
         self.manual.clear();
     }
 
+    /// Removes duplicate URIs from the manual queue while keeping the earliest occurrence.
+    pub fn deduplicate_manual(&mut self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let before = self.manual.len();
+        self.manual.retain(|t| seen.insert(t.uri.to_string()));
+        before - self.manual.len()
+    }
+
+    /// Replaces the manual and upcoming context items cleanly during session restore.
+    pub fn restore_snapshot(
+        &mut self,
+        context_name: String,
+        active_track: Option<TrackSummary>,
+        manual: Vec<TrackSummary>,
+        upcoming_context: Vec<TrackSummary>,
+    ) {
+        self.context_name = context_name;
+        self.context_uri = None;
+        self.manual = manual;
+        self.context_tracks = upcoming_context;
+        self.unshuffled_context = None;
+        self.current_context_index = None;
+        self.context_cursor = 0;
+        self.playing_from_manual = false;
+        self.current_uri = active_track.as_ref().map(|t| t.uri.clone());
+        self.current_track = active_track;
+    }
+
     /// Replaces the active context and positions the upcoming cursor right after `playing_index`.
     pub fn set_context(
         &mut self,
@@ -457,6 +485,7 @@ impl TwoTierQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulse_model::MediaSource;
 
     fn track(id: &str) -> TrackSummary {
         TrackSummary {
@@ -471,6 +500,9 @@ mod tests {
             is_liked: false,
             is_playable: true,
             added_at_unix: None,
+            source: MediaSource::Spotify,
+            local_path: None,
+            codec_label: None,
         }
     }
 

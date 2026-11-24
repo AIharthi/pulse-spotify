@@ -12,7 +12,7 @@ use http::{Request, header};
 use protobuf::Message as _;
 use pulse_model::{
     AlbumSummary, AppConfig, ArtistDetail, ArtistSummary, BackendEvent, CrateRef, ImageRef,
-    PlaylistSummary, SearchResults, SortOrder, TrackDetail, TrackSummary,
+    MediaSource, PlaylistSummary, SearchResults, SortOrder, TrackDetail, TrackSummary,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -359,10 +359,11 @@ impl LibraryService {
                 let detail = self.load_artist_detail(session, uri).await?;
                 Ok(vec![BackendEvent::ArtistDetailLoaded(detail)])
             }
-            CrateRef::Search { query } => {
+            CrateRef::Search { query, .. } => {
                 let results = self.search(session, paths, web_token, query).await?;
                 Ok(vec![BackendEvent::SearchResultsLoaded(results)])
             }
+            _ => Err("not a Spotify collection".to_string()),
         }
     }
 
@@ -549,6 +550,7 @@ impl LibraryService {
                         total_duration_ms: 0,
                         cover,
                         is_collaborative,
+                        source: MediaSource::Spotify,
                     });
                 }
 
@@ -806,6 +808,7 @@ impl LibraryService {
             name: artist.name,
             cover,
             is_followed,
+            source: MediaSource::Spotify,
         };
 
         Ok(ArtistDetail {
@@ -921,11 +924,7 @@ impl LibraryService {
             }
         }
 
-        // Supplement with local playback history persisted across runs, keeping the newer timestamp.
         for entry in &local_recent.entries {
-            if !entry.uri.starts_with("spotify:track:") {
-                continue;
-            }
             let local_ts = entry.played_at_secs as i64;
             if let Some(existing) = by_uri.get_mut(&entry.uri) {
                 if existing.added_at_unix.unwrap_or(0) < local_ts {
@@ -934,6 +933,8 @@ impl LibraryService {
                 continue;
             }
             order.push(entry.uri.clone());
+            let src = MediaSource::from_uri(&entry.uri);
+            let local_path = entry.uri.strip_prefix("local:").map(Arc::from);
             by_uri.insert(
                 entry.uri.clone(),
                 TrackSummary {
@@ -948,6 +949,9 @@ impl LibraryService {
                     is_liked: self.liked_uri_set.contains(&entry.uri),
                     is_playable: true,
                     added_at_unix: Some(local_ts),
+                    source: src,
+                    local_path,
+                    codec_label: None,
                 },
             );
         }
@@ -1071,6 +1075,7 @@ impl LibraryService {
                 playlists: Vec::new(),
                 tracks,
                 tracks_only_fallback: true,
+                source_filter: None,
             });
         }
 
@@ -1249,6 +1254,9 @@ impl LibraryService {
                 is_liked: self.liked_uri_set.contains(uri_str),
                 is_playable: true,
                 added_at_unix: None,
+                source: MediaSource::Spotify,
+                local_path: None,
+                codec_label: None,
             },
             track_number: (track.number > 0).then_some(track.number as u32),
             disc_total_tracks,
@@ -1284,7 +1292,12 @@ pub async fn fetch_cover_bytes(
         }
     }
 
-    let bytes = if let Some(image_hex) = extract_spotify_image_id(trimmed) {
+    let bytes = if trimmed.starts_with("file://") {
+        let raw_path = trimmed.trim_start_matches("file://");
+        tokio::fs::read(raw_path)
+            .await
+            .map_err(|e| format!("failed to read local cover {raw_path}: {e}"))?
+    } else if let Some(image_hex) = extract_spotify_image_id(trimmed) {
         if let Some(sess) = session
             && let Some(raw_id) = decode_hex(&image_hex)
             && raw_id.len() == 20
@@ -1611,6 +1624,9 @@ async fn fetch_one_track_summary(
             is_liked: liked_set.contains(&stub.uri),
             is_playable: true,
             added_at_unix: (stub.added_at > 0).then_some(stub.added_at as i64),
+            source: MediaSource::Spotify,
+            local_path: None,
+            codec_label: None,
         }),
     )
 }
@@ -1688,6 +1704,7 @@ async fn fetch_one_album_summary(
             track_count,
             cover: pick_image_ref(&album.covers),
             album_type: Arc::from(format!("{:?}", album.album_type).to_lowercase().as_str()),
+            source: MediaSource::Spotify,
         }),
     )
 }
@@ -1740,6 +1757,7 @@ async fn fetch_one_artist_summary(
             name: artist.name,
             cover: pick_image_ref(&artist.portraits),
             is_followed: followed,
+            source: MediaSource::Spotify,
         }),
     )
 }
@@ -1879,6 +1897,7 @@ async fn fetch_one_playlist_summary(
             total_duration_ms: 0,
             cover,
             is_collaborative: attrs.collaborative(),
+            source: MediaSource::Spotify,
         }),
     )
 }
@@ -1947,6 +1966,9 @@ fn track_summary_from_web_api(t: &Value, liked_set: &HashSet<String>) -> Option<
         is_liked: liked_set.contains(uri),
         is_playable: t.get("is_playable").and_then(|v| v.as_bool()).unwrap_or(true),
         added_at_unix: None,
+        source: MediaSource::Spotify,
+        local_path: None,
+        codec_label: None,
     })
 }
 
@@ -2018,6 +2040,7 @@ fn parse_web_api_search(json: &Value, query: &str, liked_set: &HashSet<String>) 
                         .and_then(|v| v.as_str())
                         .unwrap_or("album"),
                 ),
+                source: MediaSource::Spotify,
             });
         }
     }
@@ -2044,6 +2067,7 @@ fn parse_web_api_search(json: &Value, query: &str, liked_set: &HashSet<String>) 
                 name: name.to_string(),
                 cover,
                 is_followed: false,
+                source: MediaSource::Spotify,
             });
         }
     }
@@ -2085,6 +2109,7 @@ fn parse_web_api_search(json: &Value, query: &str, liked_set: &HashSet<String>) 
                     .get("collaborative")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                source: MediaSource::Spotify,
             });
         }
     }
@@ -2179,6 +2204,9 @@ fn parse_pathfinder_search(
                 is_liked: liked_set.contains(uri),
                 is_playable: true,
                 added_at_unix: None,
+                source: MediaSource::Spotify,
+                local_path: None,
+                codec_label: None,
             });
         }
     }
@@ -2234,6 +2262,7 @@ fn parse_pathfinder_search(
                 track_count: 0,
                 cover,
                 album_type: Arc::from("album"),
+                source: MediaSource::Spotify,
             });
         }
     }
@@ -2269,6 +2298,7 @@ fn parse_pathfinder_search(
                 name: name.to_string(),
                 cover,
                 is_followed: false,
+                source: MediaSource::Spotify,
             });
         }
     }
@@ -2311,6 +2341,7 @@ fn parse_pathfinder_search(
                 total_duration_ms: 0,
                 cover,
                 is_collaborative: false,
+                source: MediaSource::Spotify,
             });
         }
     }

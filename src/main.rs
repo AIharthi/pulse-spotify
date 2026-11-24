@@ -1,4 +1,4 @@
-//! Pulse Spotify client binary entry point (`iced 0.14` tiny-skia UI + `pulse-backend`).
+//! Pulse desktop binary entry point (native GTK4 + Cairo UI and `pulse-backend`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,7 +7,7 @@ use pulse_assets::{CoverCache, MAX_HERO_SLOTS, MAX_THUMB_SLOTS};
 use pulse_backend::BackendHandle;
 use pulse_model::{AppViewState, ImageRef};
 use pulse_ui::bytes::Bytes;
-use pulse_ui::{CommandSendFn, CoverFetchFn, MetricsObserverFn, PulseAppLaunch};
+use pulse_ui::{CommandSendFn, CoverFetchFn, MetricsObserverFn, PulseAppLaunch, SpectrumReadFn};
 
 fn main() {
     // Bound Tokio worker threads, glibc malloc arenas, and static PulseAudio stream properties
@@ -18,6 +18,19 @@ fn main() {
         std::env::set_var("PULSE_PROP_application.icon_name", "pulse-spotify");
         std::env::set_var("PULSE_PROP_media.role", "music");
         libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
+    let mut self_test_dir: Option<PathBuf> = None;
+    let mut startup_inputs: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--self-test-ui" {
+            self_test_dir = args.next().map(PathBuf::from);
+        } else if let Some(rest) = arg.strip_prefix("--self-test-ui=") {
+            self_test_dir = Some(PathBuf::from(rest));
+        } else {
+            startup_inputs.push(arg);
+        }
     }
 
     let (backend, event_rx) = match BackendHandle::spawn(Arc::new(|| {})) {
@@ -43,6 +56,14 @@ fn main() {
         if let Some(handle) = backend_for_cmds.upgrade() {
             let _ = handle.send(cmd);
         }
+    });
+
+    let backend_for_viz = Arc::downgrade(&backend);
+    let spectrum_reader: SpectrumReadFn = Arc::new(move || {
+        backend_for_viz
+            .upgrade()
+            .map(|h| h.snapshot_spectrum())
+            .unwrap_or_default()
     });
 
     let backend_for_covers = Arc::downgrade(&backend);
@@ -83,9 +104,12 @@ fn main() {
         initial_view,
         cover_cache,
         command_sender,
+        spectrum_reader,
         event_rx: Arc::new(Mutex::new(Some(event_rx))),
         cover_fetcher,
         metrics_observer: Some(metrics_observer),
+        startup_inputs,
+        self_test_dir,
     };
 
     let ui_result = pulse_ui::app::run(launch);

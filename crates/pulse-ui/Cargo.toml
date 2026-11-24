@@ -8,20 +8,15 @@ rust-version.workspace = true
 [dependencies]
 pulse-model = { path = "../pulse-model" }
 pulse-assets = { path = "../pulse-assets" }
-# Use image-without-codecs instead of image so iced does not enable image/default (rayon + ravif).
-iced = { version = "0.14.0", default-features = false, features = [
-    "wgpu",
-    "tiny-skia",
-    "fira-sans",
-    "tokio",
-    "svg",
-    "image-without-codecs",
-    "crisp",
-    "web-colors",
-    "linux-theme-detection",
-    "wayland",
-    "x11",
-] }
 bytes.workspace = true
+cairo-rs.workspace = true
+dirs.workspace = true
+gdk-pixbuf.workspace = true
+gdk4.workspace = true
+gio.workspace = true
+glib.workspace = true
+gsk4.workspace = true
+gtk4.workspace = true
 image.workspace = true
+pango.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }

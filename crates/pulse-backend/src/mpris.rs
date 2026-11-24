@@ -158,7 +158,12 @@ impl LocalRootInterface for PulseMprisImp {
     }
 
     async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
-        Ok(vec!["spotify".to_string()])
+        Ok(vec![
+            "file".to_string(),
+            "spotify".to_string(),
+            "http".to_string(),
+            "https".to_string(),
+        ])
     }
 
     async fn supported_mime_types(&self) -> fdo::Result<Vec<String>> {
@@ -263,6 +268,8 @@ impl LocalPlayerInterface for PulseMprisImp {
                 track_uri: uri,
                 index: 0,
             });
+        } else if !uri.trim().is_empty() {
+            let _ = self.cmd_tx.send(UiCommand::ResolveInputUrl(uri));
         }
         Ok(())
     }

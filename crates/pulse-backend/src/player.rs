@@ -37,6 +37,9 @@ use spotatui_librespot_playback::player::Player;
 use spotatui_librespot_protocol::connect::ClusterUpdate;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
+use crate::dsp::SharedDsp;
+use crate::providers::youtube::download_youtube_audio_bytes;
+
 static AUDIO_KEY_REJECTED: AtomicBool = AtomicBool::new(false);
 static FFMPEG_VORBIS_MODE: AtomicU8 = AtomicU8::new(0);
 static STAGED_TRACKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -52,7 +55,6 @@ const DEFAULT_SOUNDCLOUD_CLIENT_ID: &str = "mCvc6pfl077AipUMKehAWm2ICrAJ1xiU";
 const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FFMPEG_OUTPUT_BYTES: u64 = 24 * 1024 * 1024;
 const YOUTUBE_WEB_CLIENT_VERSION: &str = "2.20260101.00.00";
-const YOUTUBE_IOS_CLIENT_VERSION: &str = "20.10.4";
 
 /// Stream of passive `ClusterUpdate` messages from the Spotify Dealer websocket.
 pub type ClusterStream = BoxedStreamResult<ClusterUpdate>;
@@ -92,15 +94,17 @@ struct LowLatencyPulseSink {
     sink: Option<Simple>,
     device: Option<String>,
     flush_requested: Arc<AtomicBool>,
+    dsp: Arc<SharedDsp>,
     pcm_bytes: Vec<u8>,
 }
 
 impl LowLatencyPulseSink {
-    fn new(device: Option<String>, flush_requested: Arc<AtomicBool>) -> Self {
+    fn new(device: Option<String>, flush_requested: Arc<AtomicBool>, dsp: Arc<SharedDsp>) -> Self {
         Self {
             sink: None,
             device,
             flush_requested,
+            dsp,
             pcm_bytes: Vec::with_capacity(8192),
         }
     }
@@ -167,7 +171,8 @@ impl Sink for LowLatencyPulseSink {
             .ok_or_else(|| SinkError::NotConnected("<LowLatencyPulseSink>".to_string()))?;
 
         match packet {
-            AudioPacket::Samples(samples) => {
+            AudioPacket::Samples(mut samples) => {
+                self.dsp.process_interleaved_f64(&mut samples);
                 let samples_s16 = converter.f64_to_s16(&samples);
                 self.pcm_bytes.clear();
                 self.pcm_bytes.reserve(samples_s16.len().saturating_mul(2));
@@ -323,6 +328,7 @@ pub async fn start_local_playback(
     creds: Credentials,
     config: &AppConfig,
     initial_volume: u16,
+    dsp: Arc<SharedDsp>,
 ) -> Result<LocalPlayback, String> {
     AUDIO_KEY_REJECTED.store(false, Ordering::Relaxed);
     ensure_pipewire_alsa_user_config();
@@ -330,6 +336,7 @@ pub async fn start_local_playback(
     let resolved_sink = resolve_sink_and_device(config.audio_device.as_deref())?;
     let sink_flush = Arc::new(AtomicBool::new(false));
     let sink_flush_for_closure = Arc::clone(&sink_flush);
+    let dsp_for_closure = Arc::clone(&dsp);
 
     let mixer = Arc::new(
         SoftMixer::open(MixerConfig {
@@ -350,6 +357,7 @@ pub async fn start_local_playback(
             ResolvedSink::Pulse(dev) => Box::new(LowLatencyPulseSink::new(
                 dev.clone(),
                 Arc::clone(&sink_flush_for_closure),
+                Arc::clone(&dsp_for_closure),
             )),
             ResolvedSink::Alsa(builder, dev) => builder(dev.clone(), AudioFormat::S16),
         },
@@ -698,7 +706,7 @@ async fn http_get_bytes(http: &HttpClient, url: &str) -> Option<Bytes> {
         .ok()
 }
 
-async fn resolve_redirect_url(http: &HttpClient, start_url: &str) -> String {
+pub(crate) async fn resolve_redirect_url(http: &HttpClient, start_url: &str) -> String {
     let mut current = start_url.to_string();
     for _ in 0..5 {
         let Ok(req) = Request::builder()
@@ -807,7 +815,7 @@ async fn refresh_soundcloud_client_id(http: &HttpClient) -> Option<String> {
     None
 }
 
-async fn get_soundcloud_client_id(http: &HttpClient, force_refresh: bool) -> String {
+pub(crate) async fn get_soundcloud_client_id(http: &HttpClient, force_refresh: bool) -> String {
     let lock = SOUNDCLOUD_CLIENT_ID.get_or_init(|| AsyncMutex::new(None));
     let mut guard = lock.lock().await;
     if force_refresh {
@@ -1497,111 +1505,10 @@ async fn try_fetch_youtube_ios_ogg(
     scored.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     for (_, vid) in scored.into_iter().take(2) {
-        let player_body = serde_json::json!({
-            "context": {
-                "client": {
-                    "clientName": "IOS",
-                    "clientVersion": YOUTUBE_IOS_CLIENT_VERSION,
-                    "deviceMake": "Apple",
-                    "deviceModel": "iPhone16,2",
-                    "osName": "iOS",
-                    "osVersion": "18.3.2.22D82",
-                    "hl": "en",
-                    "gl": "US"
-                }
-            },
-            "videoId": vid,
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        });
-        let Some(player_json) = http_post_json(
-            http,
-            "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false",
-            &[
-                ("X-YouTube-Client-Name", "5"),
-                ("X-YouTube-Client-Version", YOUTUBE_IOS_CLIENT_VERSION),
-            ],
-            &player_body,
-        )
-        .await
-        else {
-            continue;
-        };
-        if player_json
-            .get("playabilityStatus")
-            .and_then(|p| p.get("status"))
-            .and_then(|s| s.as_str())
-            != Some("OK")
+        if let Ok((raw, is_complete, _)) = download_youtube_audio_bytes(http, &vid).await
+            && let Some(ogg) = ffmpeg_transcode_to_ogg(raw).await
         {
-            continue;
-        }
-        let Some(formats) = player_json
-            .get("streamingData")
-            .and_then(|s| s.get("adaptiveFormats"))
-            .and_then(|f| f.as_array())
-        else {
-            continue;
-        };
-
-        let chosen_fmt = formats
-            .iter()
-            .find(|f| f.get("itag").and_then(|i| i.as_i64()) == Some(140))
-            .or_else(|| {
-                formats.iter().find(|f| {
-                    f.get("mimeType")
-                        .and_then(|m| m.as_str())
-                        .is_some_and(|m| m.starts_with("audio/"))
-                })
-            });
-
-        let Some(fmt) = chosen_fmt else {
-            continue;
-        };
-        let Some(base_url) = fmt.get("url").and_then(|u| u.as_str()) else {
-            continue;
-        };
-        let expected_len = fmt
-            .get("contentLength")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-
-        // YouTube IOS serves ~1 MB (~61.5s at itag 140) starting cleanly at 0:00 via ranged GETs.
-        let mut raw = Vec::new();
-        let chunk_size = 200_000usize;
-        let sep = if base_url.contains('?') { '&' } else { '?' };
-        for chunk_idx in 0..8usize {
-            let start = chunk_idx * chunk_size;
-            let end = start + chunk_size - 1;
-            let ranged_url = format!("{base_url}{sep}range={start}-{end}");
-            let Some(chunk) = http_get_bytes(http, &ranged_url).await else {
-                break;
-            };
-            if chunk.is_empty() {
-                break;
-            }
-            let len = chunk.len();
-            if raw.len() + len > MAX_DOWNLOAD_BYTES {
-                break;
-            }
-            raw.extend_from_slice(&chunk);
-            if len < chunk_size {
-                break;
-            }
-        }
-
-        if raw.len() >= 100_000 {
-            let is_complete = raw
-                .len()
-                .saturating_mul(100)
-                .checked_div(expected_len)
-                .map_or(
-                    spotify_duration_ms > 0 && spotify_duration_ms <= 65_000,
-                    |pct| pct >= 85,
-                );
-            if let Some(ogg) = ffmpeg_transcode_to_ogg(raw).await {
-                return Some((ogg, is_complete));
-            }
+            return Some((ogg, is_complete));
         }
     }
     None
@@ -1954,8 +1861,8 @@ mod tests {
 
     #[test]
     fn multibyte_utf8_contains_term_and_unicode_alnum_and_empty_artist() {
-        assert!(contains_term("björk — jóga (live)", "live"));
-        assert!(!contains_term("björk — jóga", "live"));
+        assert!(contains_term("björk \u{2014} jóga (live)", "live"));
+        assert!(!contains_term("björk \u{2014} jóga", "live"));
         assert_eq!(normalize_alnum("崎山 蒼志!"), "崎山 蒼志");
         assert!(!artist_matches("", "M83"));
         assert!(!artist_matches("M83", ""));

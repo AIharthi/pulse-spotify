@@ -1,0 +1,26 @@
+{
+  "name": "Pulse",
+  "mode": "operate",
+  "dials": {
+    "energy": 2,
+    "rhythm": 2,
+    "motion": 2
+  },
+  "typography": {
+    "sans": "IBM Plex Sans",
+    "mono": "IBM Plex Mono",
+    "tabularNums": true
+  },
+  "radii": {
+    "modal": 16,
+    "card": 12,
+    "control": 8,
+    "chip": 999
+  },
+  "contrast": {
+    "normalTextMin": 4.5,
+    "largeTextAndUiMin": 3.0
+  },
+  "themes": ["dark", "light", "system"],
+  "accentSources": ["album-reactive", "matugen-system", "warm-amber"]
+}

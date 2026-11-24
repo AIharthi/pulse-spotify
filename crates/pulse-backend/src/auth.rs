@@ -22,6 +22,7 @@ use spotatui_librespot_core::session::Session;
 use url::{Url, form_urlencoded};
 
 use crate::config::{AppPaths, WebApiToken, lock_down_credentials_file};
+use crate::dsp::SharedDsp;
 use crate::player::{LocalPlayback, start_local_playback};
 
 /// Official Spotify Desktop "Keymaster" client ID used by librespot.
@@ -459,10 +460,11 @@ pub async fn connect_and_verify_session(
     creds: Credentials,
     config: &AppConfig,
     initial_volume: u16,
+    dsp: Arc<SharedDsp>,
 ) -> Result<ConnectOutcome, String> {
     let session = Session::new(session_cfg, Some(cache));
     let local_playback =
-        start_local_playback(&session, creds.clone(), config, initial_volume).await?;
+        start_local_playback(&session, creds.clone(), config, initial_volume, dsp).await?;
 
     lock_down_credentials_file(paths);
     let reusable_creds = session
